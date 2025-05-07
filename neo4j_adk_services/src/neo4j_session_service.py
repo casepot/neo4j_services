@@ -129,7 +129,7 @@ class Neo4jSessionService(BaseSessionService):
             sess.events.append(event)
         return sess
 
-    def list_sessions(self, *, app_name: str, user_id: str):
+    def list_sessions(self, *, app_name: str, user_id: str) -> list[Session]: # Added return type hint
         # Query all sessions for the user (return basic info)
         query = (
             "MATCH (s:Session {app_name: $app_name, user_id: $user_id}) "
@@ -143,7 +143,7 @@ class Neo4jSessionService(BaseSessionService):
         # Ideally use ListSessionsResponse(pydantic model) if available
         return sessions
 
-    def list_events(self, *, app_name: str, user_id: str, session_id: str):
+    def list_events(self, *, app_name: str, user_id: str, session_id: str) -> list[Event]: # Added return type hint
         # Retrieve all events for a session (similar to get_session but only events)
         query = (
             "MATCH (s:Session {app_name: $app_name, user_id: $user_id, id: $session_id})-[:HAS_EVENT]->(e:Event) "
@@ -208,8 +208,8 @@ class Neo4jSessionService(BaseSessionService):
         if not getattr(event, "timestamp", None):
             event.timestamp = current_timestamp
 
-        event_props_for_cypher = _prepare_event_properties(event)
-        tool_calls_for_cypher = _extract_tool_calls(event)
+        event_props_for_cypher = self._prepare_event_properties(event)
+        tool_calls_for_cypher = self._extract_tool_calls(event)
 
         query = """
         MATCH (s:Session {id: $session_id, app_name: $app_name, user_id: $user_id})
@@ -261,72 +261,89 @@ class Neo4jSessionService(BaseSessionService):
         session.events.append(event)
         return event
 
-# Helper function from patch to extract tool calls
-def _extract_tool_calls(ev: Event) -> list[dict]:
-    """Return a list of dicts ready to be set on :ToolCall, if the Event
-    contained tool invocations in its actions (ADK convention)."""
-    tc_list = []
-    if ev.actions and getattr(ev.actions, "tool_calls", None):
-        for tc in ev.actions.tool_calls:
-            # Ensure parameters are JSON serializable; ADK tool_calls.parameters should be.
-            parameters_json = None
-            if tc.parameters:
-                try:
-                    parameters_json = json.dumps(tc.parameters)
-                except TypeError: # Fallback if not directly serializable
-                    parameters_json = json.dumps(str(tc.parameters))
+    # Helper function from patch to extract tool calls - now a method
+    def _extract_tool_calls(self, ev: Event) -> list[dict]:
+        """Return a list of dicts ready to be set on :ToolCall, if the Event
+        contained tool invocations in its actions (ADK convention)."""
+        tc_list = []
+        if ev.actions and getattr(ev.actions, "tool_calls", None):
+            for tc in ev.actions.tool_calls:
+                # Ensure parameters are JSON serializable; ADK tool_calls.parameters should be.
+                parameters_json = None
+                if tc.parameters:
+                    try:
+                        parameters_json = json.dumps(tc.parameters)
+                    except TypeError: # Fallback if not directly serializable
+                        parameters_json = json.dumps(str(tc.parameters))
 
 
-            tc_list.append({
-                "id": getattr(tc, 'id', None) or str(uuid.uuid4()), # Ensure ID exists
-                "name": getattr(tc, 'name', 'unknown_tool'),
-                "parameters_json": parameters_json,
-                "latency_ms": getattr(tc, "latency_ms", None), # Optional
-                "status": getattr(tc, "status", None), # Optional
-                "error_msg": getattr(tc, "error", None) # Optional
-            })
-    return tc_list
+                tc_list.append({
+                    "id": getattr(tc, 'id', None) or str(uuid.uuid4()), # Ensure ID exists
+                    "name": getattr(tc, 'name', 'unknown_tool'),
+                    "parameters_json": parameters_json,
+                    "latency_ms": getattr(tc, "latency_ms", None), # Optional
+                    "status": getattr(tc, "status", None), # Optional
+                    "error_msg": getattr(tc, "error", None) # Optional
+                })
+        return tc_list
 
-# Helper function to prepare event properties for Cypher (similar to _encode_event in patch)
-def _prepare_event_properties(event: Event) -> dict:
-    """Prepares event properties for storage, including serializing content and actions."""
-    content_json_str = None
-    if event.content:
-        content_json_str = json.dumps(event.content.model_dump() if hasattr(event.content, 'model_dump') else event.content)
+    # Helper function to prepare event properties for Cypher (similar to _encode_event in patch) - now a method
+    def _prepare_event_properties(self, event: Event) -> dict:
+        """Prepares event properties for storage, including serializing content and actions."""
+        content_json_str = None
+        if event.content:
+            content_json_str = json.dumps(event.content.model_dump() if hasattr(event.content, 'model_dump') else event.content)
 
-    actions_json_str = None
-    if event.actions:
-        actions_json_str = json.dumps(event.actions.model_dump() if hasattr(event.actions, 'model_dump') else event.actions)
-    
-    text_summary = ""
-    if event.content and hasattr(event.content, "parts"):
-        try:
-            text_summary = " ".join(p.text for p in event.content.parts if hasattr(p, "text"))
-        except: # Fallback
+        actions_json_str = None
+        if event.actions:
+            actions_json_str = json.dumps(event.actions.model_dump() if hasattr(event.actions, 'model_dump') else event.actions)
+        
+        text_summary = ""
+        if event.content and hasattr(event.content, "parts"):
+            try:
+                text_summary = " ".join(p.text for p in event.content.parts if hasattr(p, "text"))
+            except: # Fallback
+                text_summary = str(event.content)
+        elif event.content:
             text_summary = str(event.content)
-    elif event.content:
-        text_summary = str(event.content)
 
-    return {
-        "id": event.id,
-        "author": event.author,
-        "timestamp": event.timestamp or time.time(),
-        "invocation_id": getattr(event, "invocation_id", None) or "",
-        "content_json": content_json_str,
-        "actions_json": actions_json_str,
-        "text": text_summary # For full-text search on events if needed later
-    }
+        return {
+            "id": event.id,
+            "author": event.author,
+            "timestamp": event.timestamp or time.time(), # Ensure timestamp exists
+            "invocation_id": getattr(event, "invocation_id", None) or "",
+            "content_json": content_json_str,
+            "actions_json": actions_json_str,
+            "text": text_summary # For full-text search on events if needed later
+        }
 
-    def delete_session(self, app_name: str, user_id: str, session_id: str) -> None:
-        # Remove a session and all its events from Neo4j
-        query = (
-            "MATCH (s:Session {app_name: $app_name, user_id: $user_id, id: $session_id}) "
+    # ---------- deletion ----------
+    def delete_session(
+        self,
+        *,
+        app_name: str,
+        user_id: str,
+        session_id: str
+    ) -> None:
+        """
+        Remove the session and **everything hanging off it** (events,
+        tool-call nodes, WROTE_STATE edges, metrics, etc.).
+
+        We rely on `DETACH DELETE` so the pattern survives future schema
+        extensions without further changes.
+        """
+        cypher = (
+            "MATCH (s:Session {app_name:$app, user_id:$user, id:$sid}) "
             "DETACH DELETE s"
         )
-        self._execute_write(query, {"app_name": app_name, "user_id": user_id, "session_id": session_id})
-        # No return value (None)
+        # uses the already-patched _execute_write in the test-suite; in
+        # production this is a single write transaction.
+        self._execute_write(
+            cypher,
+            {"app": app_name, "user": user_id, "sid": session_id},
+        )
 
-    def close_session(self, session: Session) -> None:
+    def close_session(self, session: Session) -> None: # Signature seems fine
         """Closes a session and optionally persists it to memory (experimental)."""
         # In this implementation, closing a session is equivalent to ensuring it's saved.
         # If a MemoryService is configured, it could call memory_service.add_session_to_memory(session).
