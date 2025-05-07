@@ -1,0 +1,48 @@
+[project]
+name = "google-adk-neo4j-services"
+version = "0.1.0"
+description = "Neo4j backed Session and Memory services for Google ADK"
+readme = "README.md" # Assuming a README will be created later
+requires-python = ">=3.8"
+license = {text = "Apache-2.0"} # Or other appropriate license
+authors = [
+    {name = "Your Name/Org", email = "your.email@example.com"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Database",
+]
+
+dependencies = [
+    "neo4j>=5.0",
+    "google-adk", # Assuming google-adk is the core dependency
+    "google-genai", # For types, if not bundled with adk
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    # "testcontainers[neo4j]", # For integration tests
+]
+# Example of how the original document suggested for ADK itself:
+# neo4j = ["neo4j>=5.0"] # This is now in main dependencies for this package
+
+[project.urls]
+Homepage = "https://github.com/your-repo/google-adk-neo4j-services" # Example
+Repository = "https://github.com/your-repo/google-adk-neo4j-services" # Example
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+# If you plan to use Ruff for linting/formatting (good practice)
+# [tool.ruff]
+# line-length = 120
