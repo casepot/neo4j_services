@@ -122,9 +122,9 @@ The services attempt to create the following constraints and indexes upon initia
     *   `CALL db.index.fulltext.createNodeIndex('MemoryTextIndex', ['MemoryChunk'], ['text'])` (Handled by `Neo4jMemoryService`)
 *   **Vector Index** (for `Neo4jMemoryService`, if `vector_dimension` is provided):
     *   `CALL db.index.vector.createNodeIndex('MemoryVectorIndex', 'MemoryChunk', 'embedding', $dim, 'cosine')` (Handled by `Neo4jMemoryService`)
-    *   Alternatively, for newer Neo4j versions:
+    *   Alternatively, for newer Neo4j versions (5.7+):
         ```cypher
-        CREATE VECTOR INDEX memoryVectorIdx IF NOT EXISTS
+        CREATE VECTOR INDEX MemoryVectorIndex IF NOT EXISTS
         FOR (m:MemoryChunk) ON (m.embedding)
         OPTIONS {indexConfig:{`vector.dimensions`:1536, `vector.similarity_function`:'cosine'}};
         ```
@@ -134,18 +134,22 @@ The services attempt to create the following constraints and indexes upon initia
 
 1.  **Prerequisites**:
     *   Python >= 3.8
-    *   Access to a Neo4j database (version 4.4+ recommended, 5.x for vector index support).
+    *   Access to a Neo4j database (version 5.x recommended, e.g., `5.26.6` for tests).
     *   `uv` or `pip` for package installation.
 
 2.  **Install Dependencies**:
-    The package relies on `neo4j`, `google-adk`, and `google-genai`. These are listed in `pyproject.toml`.
+    The package relies on `neo4j`, `google-adk`, `google-genai`, and `testcontainers` (for development).
+    Key versions (see `pyproject.toml` for exact pinning):
+    *   `neo4j>=5.28,<6`
+    *   `testcontainers[neo4j]>=4.10,<5`
 
     To install the package and its dependencies in editable mode (recommended for development):
     ```bash
     # From the root of this repository (e.g., /home/case/neo4j_services)
-    uv pip install -e ./neo4j_adk_services
+    # Ensure to quote the argument if using zsh to prevent globbing issues:
+    uv pip install -e "./neo4j_adk_services[dev]"
     # OR
-    # python3 -m pip install -e ./neo4j_adk_services
+    # python3 -m pip install -e "./neo4j_adk_services[dev]"
     ```
 
 ## Configuration
@@ -264,22 +268,26 @@ memory_service = Neo4jMemoryService(
 #     from google.adk.sessions import Session as ADKSession
 #     from google.adk.events import Event as ADKEvent
 #     from google.genai.types import Content as GenaiContent, Part as GenaiPart
+#     import time
 #     dummy_event = ADKEvent(id="evt_mem_test", author="user", timestamp=time.time(), content=GenaiContent(parts=[GenaiPart(text="Test memory content about Neo4j.")]))
 #     my_session = ADKSession(id="sess_mem_test", app_name="my_adk_app", user_id="user123", state={}, events=[dummy_event], last_update_time=time.time())
 
 
 # Add a session's events to memory
 # Ensure my_session is defined and has events
-if 'my_session' in locals() and my_session.events:
-    memory_service.add_session_to_memory(session=my_session)
+if 'my_session' in locals() and hasattr(my_session, 'events') and my_session.events:
+    # Neo4jMemoryService.add_session_to_memory is async
+    import asyncio
+    asyncio.run(memory_service.add_session_to_memory(session=my_session))
     print(f"Session {my_session.id} processed for memory.")
 else:
     print("Skipping add_session_to_memory as my_session is not defined or has no events.")
 
 
-# Search memory
+# Search memory (async)
 search_query = "Neo4j"
-memory_results = memory_service.search_memory(
+# memory_results = asyncio.run(memory_service.search_memory( # if running from sync context
+memory_results = memory_service.search_memory_sync( # using the sync wrapper
     app_name="my_adk_app",
     user_id="user123",
     query=search_query
@@ -297,26 +305,44 @@ if hasattr(memory_results, "memories"): # memory_results is a SearchMemoryRespon
             print(f"    Event ({event_detail.id} by {event_detail.author}): {event_text}")
 
 
-# Close the driver
-memory_service.close()
+# Close the driver (async)
+# asyncio.run(memory_service.close()) # if running from sync context
+# For simplicity, if the main program is sync, and this is the end, direct call might be okay
+# but proper async teardown is better. If memory_service was used in an async context,
+# await memory_service.close() would be used there.
+# Since search_memory_sync was used, we assume a sync context for close as well for this example.
+# However, the .close() method itself is async.
+# A simple way if you are at the very end of a script:
+loop = asyncio.get_event_loop()
+try:
+    loop.run_until_complete(memory_service.close())
+except RuntimeError as e:
+    if "Cannot run an event loop while another is running" in str(e):
+        # If an outer loop is already running (e.g. in Jupyter), this might be tricky.
+        # For simple scripts, creating a new loop if none is running is an option.
+        new_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(new_loop)
+        new_loop.run_until_complete(memory_service.close())
+    else:
+        raise
 ```
 
 ## Running Tests
 
 1.  **Prerequisites**:
     *   Docker installed and running (for integration tests).
-    *   The `neo4j_adk_services` package and its `dev` dependencies installed (e.g., `uv pip install -e "./neo4j_adk_services[dev]"`). This will include `pytest`, `pytest-asyncio`, and `testcontainers`.
+    *   The `neo4j_adk_services` package and its `dev` dependencies installed (e.g., `uv pip install -e "./neo4j_adk_services[dev]"`). This will include `pytest`, `pytest-asyncio`, and `testcontainers` (version `4.10.x` or as specified in `pyproject.toml`).
 
 2.  **Execute Tests**:
-    The integration tests now use `Testcontainers` to automatically spin up a Neo4j 5.19 Docker container with the APOC plugin. There is no need to manually start a Neo4j container for running the tests.
+    The integration tests use `Testcontainers` to automatically spin up a Neo4j Docker container (version `5.26.6` as configured in `tests/conftest.py`) with the APOC plugin enabled via the `NEO4J_PLUGINS` environment variable. There is no need to manually start a Neo4j container for running the tests.
 
     Navigate to the root of the workspace (`/home/case/neo4j_services`) and run:
     ```bash
-    pytest neo4j_adk_services/tests
+    pytest neo4j_adk_services/tests -v
     ```
     Or, using `uv`:
     ```bash
-    uv run pytest neo4j_adk_services/tests
+    uv run pytest neo4j_adk_services/tests -v
     ```
     The tests will:
     *   Start a Neo4j container.
@@ -327,17 +353,21 @@ memory_service.close()
 *   **`TypeError: Can't instantiate abstract class Neo4jSessionService without an implementation for abstract method ...`**: Ensure all abstract methods from `BaseSessionService` (and `BaseMemoryService` for `Neo4jMemoryService`) are implemented with matching signatures.
 *   **`neo4j.exceptions.ServiceUnavailable: Couldn't connect to localhost:7687... Connection refused`**:
     *   Verify the Neo4j Docker container is running (`docker ps`).
-    *   Ensure the port `7687` is correctly published.
-    *   Allow sufficient time for Neo4j to start within the container before running applications or tests.
+    *   Ensure the port `7687` is correctly published by the container.
+    *   Allow sufficient time for Neo4j to start. The `_wait_for_neo4j` helper in `tests/conftest.py` has an increased timeout (default 20 retries * 5s delay = 100s) to accommodate slower startup times, especially with plugins like APOC.
 *   **`NameError: name '_helper_function' is not defined`**: Check that helper functions within service classes are correctly defined as methods (with `self`) and called with `self._helper_function(...)`.
 *   **`KeyError` in test mocks**: The mock database logic in `tests/test_neo4j_services.py` might need updates if the Cypher queries or the structure of data returned by the services change significantly.
+*   **`ImportError: cannot import name 'Neo4jLabsPlugin' from 'testcontainers.neo4j'`**: This occurred because `Neo4jLabsPlugin` is part of the Java Testcontainers library, not Python. The fix involves enabling APOC via the `NEO4J_PLUGINS='["apoc"]'` environment variable in the `Neo4jContainer` setup within `tests/conftest.py`.
+*   **`AttributeError: 'Neo4jContainer' object has no attribute 'get_container_name'`**: This method was removed/changed in `testcontainers-python` v4.x. The fix involves using `neo_container.get_wrapped_container().short_id` (or `.name`) to access the underlying Docker container's properties in `tests/conftest.py`.
+*   **`zsh: no matches found: ./neo4j_adk_services[dev]`**: If you encounter this error when running `uv pip install`, quote the argument: `uv pip install -e "./neo4j_adk_services[dev]"`.
 
 ## Key Design Decisions & References
 *   **Event Timeline with `NEXT`**: Inspired by temporal graph patterns for efficient ordered traversals. ([Neo4j Docs: Variable-length patterns](https://neo4j.com/docs/cypher-manual/current/patterns/variable-length-patterns/))
 *   **State Lineage with `WROTE_STATE`**: Captures the history of state changes, allowing for audit trails and debugging. ([Stack Overflow: Neo4j strategy to keep history](https://stackoverflow.com/questions/22073512/neo4j-strategy-to-keep-history-of-node-changes))
-*   **`ToolCall` Nodes**: Persists tool/function invocations (extracted from `google.genai.types.FunctionCall` objects in event content) as distinct `:ToolCall` nodes in Neo4j. This enables graph-based analysis of tool usage patterns, even though the ADK event structure itself has evolved.
+*   **`ToolCall` Nodes**: Persists tool/function invocations (extracted from `google.genai.types.FunctionCall` objects in event content) as distinct `:ToolCall` nodes in Neo4j. This enables graph-based analysis of tool usage patterns.
 *   **`DETACH DELETE`**: Used for `delete_session` to ensure cascading deletion of all related nodes and relationships. ([Neo4j Docs: Delete](https://neo4j.com/docs/cypher-manual/current/clauses/delete/#delete-delete-nodes-and-their-relationships))
 *   **Constraints and Indexes**: Essential for data integrity and query performance. ([Neo4j Docs: Constraints](https://neo4j.com/docs/cypher-manual/current/constraints/syntax/), [Neo4j Docs: Full-text indexes](https://neo4j.com/docs/cypher-manual/current/indexes/semantic-indexes/full-text-indexes/), [Neo4j Docs: Vector indexes](https://neo4j.com/docs/cypher-manual/current/indexes/semantic-indexes/vector-indexes/))
-*   **APOC for JSON conversion in Cypher**: `apoc.convert.toJson()` is used in `WROTE_STATE` relationships to store complex `fromValue` and `toValue` as JSON strings. Ensure APOC plugin is installed in Neo4j.
+*   **APOC for JSON conversion in Cypher**: `apoc.convert.toJson()` is used in `WROTE_STATE` relationships to store complex `fromValue` and `toValue` as JSON strings. Ensure APOC plugin is installed in Neo4j (handled by Testcontainers setup via `NEO4J_PLUGINS` env var).
+*   **Testcontainers Python API**: For container management in tests, refer to the [Testcontainers Python Documentation](https://testcontainers-python.readthedocs.io/).
 
 This README provides a comprehensive guide to understanding, using, and developing the Neo4j services for Google ADK.

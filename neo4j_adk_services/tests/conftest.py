@@ -2,10 +2,10 @@ import pytest
 import asyncio
 import time
 from neo4j import GraphDatabase, AsyncGraphDatabase, exceptions as neo4j_exceptions
-from testcontainers.neo4j import Neo4jContainer, Neo4jLabsPlugin
+from testcontainers.neo4j import Neo4jContainer
 
 # Helper function to wait for Neo4j to be ready
-def _wait_for_neo4j(uri: str, user="neo4j", password="test", retries=5, delay=5):
+def _wait_for_neo4j(uri: str, user="neo4j", password="test", retries=20, delay=5):
     """Polls Neo4j until it's responsive or retries are exhausted."""
     sync_driver = None
     for i in range(retries):
@@ -31,15 +31,13 @@ def neo4j_container_instance():
     """Starts a Neo4j container and yields the container object."""
     print("Starting Neo4j container for session...")
     # It's good practice to ensure the image is explicitly set if not default.
-    # Neo4j 5.19 is specified in the issue.
-    # Enable APOC plugin using the correct environment variable for Neo4j 5.x
     try:
         with Neo4jContainer("neo4j:5.26.6") \
-                .with_labs_plugins(Neo4jLabsPlugin.APOC) \
-                .with_env_variable("NEO4J_AUTH", "neo4j/test") as neo_container:
-            # v4+: use get_container_name() or omit
-            container_name = neo_container.get_container_name()
-            print(f"Neo4j test-container is up (name={container_name}) — Bolt: "
+                .with_env("NEO4J_AUTH", "neo4j/test") \
+                .with_env("NEO4J_PLUGINS", '["apoc"]') as neo_container:
+            # v4+: use get_wrapped_container() to access the underlying Docker container object
+            wrapped_container = neo_container.get_wrapped_container()
+            print(f"Neo4j test-container is up (id={wrapped_container.short_id}) — Bolt: "
                   f"{neo_container.get_connection_url()}")
             yield neo_container
     except Exception as e:
