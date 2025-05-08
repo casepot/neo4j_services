@@ -127,12 +127,21 @@ class Neo4jSessionService(BaseSessionService):
             content_obj = None
             actions_obj = None
             if props.get('content_json'):
-                content_data = json.loads(props['content_json'])
-                # google.genai.types.Content is assumed pydantic or compatible
-                content_obj = types.Content.model_validate(content_data) if hasattr(types.Content, 'model_validate') else content_data
+                try:
+                    content_data = json.loads(props['content_json'])
+                    # google.genai.types.Content is assumed pydantic or compatible
+                    content_obj = types.Content.model_validate(content_data) if hasattr(types.Content, 'model_validate') else content_data
+                except (json.JSONDecodeError, TypeError):
+                    content_obj = None # Handle potential errors during loading
             if props.get('actions_json'):
-                actions_data = json.loads(props['actions_json'])
-                actions_obj = EventActions.model_validate(actions_data) if hasattr(EventActions, 'model_validate') else EventActions(**actions_data)
+                try:
+                    actions_data = json.loads(props['actions_json'])
+                    # Check if actions_data is not None before validation/instantiation
+                    if actions_data is not None:
+                        actions_obj = EventActions.model_validate(actions_data) if hasattr(EventActions, 'model_validate') else EventActions(**actions_data)
+                    # If actions_data is None after loading, actions_obj remains None
+                except (json.JSONDecodeError, TypeError):
+                     actions_obj = None # Handle potential errors during loading
             event = Event(
                 id=props.get('id'),
                 author=props.get('author'),
@@ -174,11 +183,20 @@ class Neo4jSessionService(BaseSessionService):
                 content_obj = None
                 actions_obj = None
                 if props.get('content_json'):
-                    content_data = json.loads(props['content_json'])
-                    content_obj = types.Content.model_validate(content_data) if hasattr(types.Content, 'model_validate') else content_data
+                    try:
+                        content_data = json.loads(props['content_json'])
+                        content_obj = types.Content.model_validate(content_data) if hasattr(types.Content, 'model_validate') else content_data
+                    except (json.JSONDecodeError, TypeError):
+                        content_obj = None
                 if props.get('actions_json'):
-                    actions_data = json.loads(props['actions_json'])
-                    actions_obj = EventActions.model_validate(actions_data) if hasattr(EventActions, 'model_validate') else EventActions(**actions_data)
+                    try:
+                        actions_data = json.loads(props['actions_json'])
+                        # Check if actions_data is not None before validation/instantiation
+                        if actions_data is not None:
+                            actions_obj = EventActions.model_validate(actions_data) if hasattr(EventActions, 'model_validate') else EventActions(**actions_data)
+                        # If actions_data is None after loading, actions_obj remains None
+                    except (json.JSONDecodeError, TypeError):
+                        actions_obj = None
                 event_obj = Event( # Renamed from event to event_obj
                     id=props.get('id'),
                     author=props.get('author'),
@@ -302,31 +320,41 @@ class Neo4jSessionService(BaseSessionService):
         session.events.append(event)
         return event
 
-    # Helper function from patch to extract tool calls - now a method
+    # Updated helper function to extract tool calls using modern ADK/Gemini types
     def _extract_tool_calls(self, ev: Event) -> list[dict]:
-        """Return a list of dicts ready to be set on :ToolCall, if the Event
-        contained tool invocations in its actions (ADK convention)."""
-        tc_list = []
-        if ev.actions and getattr(ev.actions, "tool_calls", None):
-            for tc in ev.actions.tool_calls:
-                # Ensure parameters are JSON serializable; ADK tool_calls.parameters should be.
-                parameters_json = None
-                if tc.parameters:
-                    try:
-                        parameters_json = json.dumps(tc.parameters)
-                    except TypeError: # Fallback if not directly serializable
-                        parameters_json = json.dumps(str(tc.parameters))
+        """Return a list of dicts ready to be set on :ToolCall nodes,
+        extracting data from FunctionCall objects within the event content."""
+        tool_calls_for_cypher = []
+        # Use the standard ADK method to get function calls from event content
+        function_calls = ev.get_function_calls() if hasattr(ev, 'get_function_calls') else []
+        
+        for fc in function_calls or []:
+            # FunctionCall objects have 'name' and 'args' (dict)
+            # We need to generate an ID if one isn't inherent to FunctionCall
+            # Note: google.genai.types.FunctionCall doesn't have a standard 'id' field.
+            # We'll generate one for the Neo4j node.
+            tool_call_id = str(uuid.uuid4())
+            
+            parameters_json = None
+            if fc.args:
+                try:
+                    # fc.args should already be a dict
+                    parameters_json = json.dumps(fc.args)
+                except TypeError:
+                    # Fallback if args contains non-serializable types
+                    parameters_json = json.dumps(str(fc.args))
 
-
-                tc_list.append({
-                    "id": getattr(tc, 'id', None) or str(uuid.uuid4()), # Ensure ID exists
-                    "name": getattr(tc, 'name', 'unknown_tool'),
-                    "parameters_json": parameters_json,
-                    "latency_ms": getattr(tc, "latency_ms", None), # Optional
-                    "status": getattr(tc, "status", None), # Optional
-                    "error_msg": getattr(tc, "error", None) # Optional
-                })
-        return tc_list
+            tool_calls_for_cypher.append({
+                "id": tool_call_id, # Generated ID for the Neo4j node
+                "name": fc.name or 'unknown_tool',
+                "parameters_json": parameters_json,
+                # Optional fields from the old structure are not directly available
+                # on FunctionCall. They might come from FunctionResponse later.
+                "latency_ms": None,
+                "status": None,
+                "error_msg": None
+            })
+        return tool_calls_for_cypher
 
     # Helper function to prepare event properties for Cypher (similar to _encode_event in patch) - now a method
     def _prepare_event_properties(self, event: Event) -> dict:
@@ -337,7 +365,20 @@ class Neo4jSessionService(BaseSessionService):
 
         actions_json_str = None
         if event.actions:
-            actions_json_str = json.dumps(event.actions.model_dump() if hasattr(event.actions, 'model_dump') else event.actions)
+            try:
+                # Prioritize model_dump if available (for Pydantic models)
+                if hasattr(event.actions, 'model_dump'):
+                    actions_dict = event.actions.model_dump()
+                # Fallback to __dict__ for simple objects
+                elif hasattr(event.actions, '__dict__'):
+                    actions_dict = event.actions.__dict__
+                # Final fallback: attempt to convert to string if it's not serializable
+                else:
+                    actions_dict = str(event.actions)
+                actions_json_str = json.dumps(actions_dict)
+            except TypeError:
+                 # If still not serializable, store as string representation
+                 actions_json_str = json.dumps(str(event.actions))
         
         text_summary = ""
         if event.content and hasattr(event.content, "parts"):

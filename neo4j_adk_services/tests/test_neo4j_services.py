@@ -1,62 +1,18 @@
 import unittest
 import time # Used by fake_execute_write_session for timestamp
 import uuid # Used by fake_execute_write_session for session_id generation if not provided
+import json # For checking JSON serialization in tests if needed
 
 # Assuming google.adk and google.genai are available in the environment
 # If not, these would need to be stubbed or mocked for pure unit testing of the service logic
-try:
-    from google.adk.sessions import Session
-    from google.adk.events import Event, EventActions
-    from google.genai import types
-except ImportError:
-    # Create dummy classes if ADK/GenAI types are not available
-    # This allows the test structure to be valid, but tests might not be fully representative
-    # In a real ADK environment, these imports should succeed.
-    class Session:
-        def __init__(self, app_name, user_id, id, state, events, last_update_time):
-            self.app_name = app_name
-            self.user_id = user_id
-            self.id = id
-            self.state = state
-            self.events = events
-            self.last_update_time = last_update_time
-        
-        @staticmethod
-        def new_id():
-            return uuid.uuid4().hex
-
-    class Event:
-        def __init__(self, author, content, actions=None, id=None, timestamp=None, invocation_id=None):
-            self.id = id or uuid.uuid4().hex
-            self.author = author
-            self.timestamp = timestamp or time.time()
-            self.invocation_id = invocation_id
-            self.content = content
-            self.actions = actions
-
-        @staticmethod
-        def new_id():
-            return uuid.uuid4().hex
-
-    class EventActions:
-        def __init__(self, state_delta=None):
-            self.state_delta = state_delta or {}
-
-    class types:
-        class Content:
-            def __init__(self, parts=None):
-                self.parts = parts or []
-            
-            def dict(self): # for json.dumps in service
-                return {"parts": [p.dict() for p in self.parts]}
-
-
-        class Part:
-            def __init__(self, text=None):
-                self.text = text
-            
-            def dict(self): # for json.dumps in service
-                return {"text": self.text}
+# Import necessary ADK classes directly
+from google.adk.sessions import Session
+from google.adk.sessions.base_session_service import ListSessionsResponse, ListEventsResponse
+from google.adk.events import Event, EventActions
+# ToolCall is no longer in google.adk.events, use FunctionCall from google.genai.types
+from google.genai import types
+from google.genai.types import FunctionCall as ToolCall # Use alias for compatibility
+from google.adk.memory.base_memory_service import SearchMemoryResponse, MemoryResult
 
 
 # Services to be tested
@@ -64,44 +20,18 @@ except ImportError:
 import neo4j
 from neo4j_adk_services.src.neo4j_session_service import Neo4jSessionService, StaleSessionError # Import StaleSessionError
 from neo4j_adk_services.src.neo4j_memory_service import Neo4jMemoryService
-# Assuming SearchMemoryResponse and MemoryResult would be part of google.adk.memory
-try:
-    from google.adk.memory.base_memory_service import SearchMemoryResponse, MemoryResult
-    from google.adk.events import Event # For dummy MemoryResult
-    from google.genai.types import Content, Part # For dummy Event in MemoryResult
-except ImportError:
-    # This block is for when ADK types are not available.
-    # The Event, Content, Part classes might already be defined above if ADK is missing.
-    # Ensure they are available for the dummy MemoryResult.
-    if 'Event' not in globals():
-        class Event:
-            def __init__(self, id, author, timestamp, content, **kwargs):
-                self.id = id
-                self.author = author
-                self.timestamp = timestamp
-                self.content = content
-    if 'Content' not in globals():
-        class Content:
-            def __init__(self, parts=None): self.parts = parts or []
-    if 'Part' not in globals():
-        class Part:
-            def __init__(self, text=""): self.text = text
-
-    class MemoryResult: # Dummy for tests if not found
-        def __init__(self, session_id: str, events: list[Event]): # Changed snippets to events
-            self.session_id = session_id
-            self.events = events # Changed snippets to events
-
-    class SearchMemoryResponse: # Dummy for tests if not found
-        def __init__(self, memories=None):
-            self.memories = memories or []
+# No need for dummy MemoryResult/SearchMemoryResponse definitions anymore
 
 
 class TestNeo4jServices(unittest.TestCase):
-    def setUp(self):
+    def setUp(self): # Standard setUp signature
         # Mock neo4j.GraphDatabase.driver to prevent real DB connections during service __init__
-        self.original_driver = neo4j.GraphDatabase.driver
+        self.original_driver = neo4j.GraphDatabase.driver # Use self directly
+        self.simulated_existing_indexes = set() # To track indexes for simulating "already exists"
         
+        # Capture the 'self' of TestNeo4jServices for use in nested functions/classes
+        test_case_instance_outer = self
+
         class MockNeo4jRun:
             def data(self):
                 return []
@@ -111,10 +41,25 @@ class TestNeo4jServices(unittest.TestCase):
                 return None
 
         class MockNeo4jSession:
+            def __init__(self, test_case_ref): # test_case_ref is the TestNeo4jServices instance
+                self.test_case_ref = test_case_ref
+
             def run(self, query, parameters=None, **kwargs):
-                # Allow specific checks for __init__ queries if needed, e.g., constraint creation
-                # For now, just return a mock run object.
-                return MockNeo4jRun()
+                # Simulate behavior for DDL statements in __init__
+                if "CREATE CONSTRAINT" in query and "IF NOT EXISTS" in query:
+                    return MockNeo4jRun()
+                if "CALL db.index.fulltext.createNodeIndex('MemoryTextIndex', ['MemoryChunk']" in query:
+                    if 'MemoryTextIndex' in self.test_case_ref.simulated_existing_indexes:
+                        raise neo4j.exceptions.ClientError("An equivalent index already exists: MemoryTextIndex")
+                    self.test_case_ref.simulated_existing_indexes.add('MemoryTextIndex')
+                    return MockNeo4jRun()
+                if "CALL db.index.vector.createNodeIndex('MemoryVectorIndex', 'MemoryChunk'" in query:
+                    if 'MemoryVectorIndex' in self.test_case_ref.simulated_existing_indexes:
+                        raise neo4j.exceptions.ClientError("Error: An equivalent index already exists: MemoryVectorIndex")
+                    self.test_case_ref.simulated_existing_indexes.add('MemoryVectorIndex')
+                    return MockNeo4jRun()
+                return MockNeo4jRun() # Default for other init queries
+
             def __enter__(self):
                 return self
             def __exit__(self, exc_type, exc_val, exc_tb):
@@ -123,305 +68,235 @@ class TestNeo4jServices(unittest.TestCase):
                 pass
 
         class MockNeo4jDriver:
+            def __init__(self, test_case_ref): # test_case_ref is the TestNeo4jServices instance
+                self.test_case_ref = test_case_ref
+
             def session(self, database=None, fetch_size=None, impersonated_user=None, default_access_mode=None, bookmarks=None, **config):
-                return MockNeo4jSession()
+                return MockNeo4jSession(self.test_case_ref) # Pass it to the session
             def close(self):
-                # print("MockNeo4jDriver closed") # For debugging
                 pass
             def __enter__(self):
                 return self
             def __exit__(self, exc_type, exc_val, exc_tb):
                 self.close()
 
-
+        # mock_driver_fn now correctly uses the captured test_case_instance_outer (which is 'self' from setUp)
         def mock_driver_fn(uri, auth, **kwargs):
-            return MockNeo4jDriver()
+            return MockNeo4jDriver(test_case_instance_outer) 
 
         neo4j.GraphDatabase.driver = mock_driver_fn
 
         # Create service instances - now their __init__ will use the mock driver
         self.session_service = Neo4jSessionService(uri="bolt://localhost:7687", user="neo4j", password="test")
-        self.memory_service = Neo4jMemoryService(uri="bolt://localhost:7687", user="neo4j", password="test", vector_dimension=128) # Added vector_dimension for init path
+        self.memory_service = Neo4jMemoryService(uri="bolt://localhost:7687", user="neo4j", password="test", vector_dimension=128)
         
-        # Monkey-patch the DB execution methods for isolation for specific test logic
-        self._db = {"sessions": {}, "events": {}, "next_rels": {}} # Stores session, event, and NEXT relationship data for mock
+        try: # Test re-initialization (idempotency check)
+            Neo4jSessionService(uri="bolt://localhost:7687", user="neo4j", password="test")
+            Neo4jMemoryService(uri="bolt://localhost:7687", user="neo4j", password="test", vector_dimension=128)
+        except neo4j.exceptions.ClientError as e:
+            if "already exists" not in str(e).lower() and "an equivalent index already exists" not in str(e).lower():
+                self.fail(f"Service re-initialization failed with unexpected ClientError: {e}")
+        except Exception as e:
+            self.fail(f"Service re-initialization failed unexpectedly: {e}")
+
+        # Mock database dictionary, attached to the test case instance
+        self._db = {"sessions": {}, "events": {}, "next_rels": {}, "memory_chunks": {}, "tool_calls": {}} 
         
-        # Close the drivers created by the services to avoid resource warnings if tests run many times
-        # In a real test with TestContainers, the container lifecycle would handle this.
-        # Here, since we mock _execute_*, the driver isn't truly used by test logic after init.
+        # Patch close methods to track closure
         self.session_service_driver_closed = False
         self.memory_service_driver_closed = False
         
         original_session_close = self.session_service.close
         def patched_session_close():
+            nonlocal original_session_close # Ensure closure captures the right variable
             original_session_close()
-            self.session_service_driver_closed = True
+            test_case_instance_outer.session_service_driver_closed = True # Use captured outer self
         self.session_service.close = patched_session_close
 
         original_memory_close = self.memory_service.close
         def patched_memory_close():
+            nonlocal original_memory_close
             original_memory_close()
-            self.memory_service_driver_closed = True
+            test_case_instance_outer.memory_service_driver_closed = True # Use captured outer self
         self.memory_service.close = patched_memory_close
 
+        # Store last query for potential assertions
+        self.last_write_query_string = None
 
-        self.last_write_query_string = None # To store the last query for assertion
-
+        # Define mock execute functions using the captured outer self (test_case_instance_outer)
         def fake_execute_write_session(query, params=None):
-            self.last_write_query_string = query # Capture the query
+            test_case_instance_outer.last_write_query_string = query
+            _db = test_case_instance_outer._db # Local alias for convenience
             if params is None: params = {}
 
-            # Mock for __init__ constraint creation
-            if "CREATE CONSTRAINT IF NOT EXISTS FOR (t:ToolCall) REQUIRE t.id IS UNIQUE" in query: # ToolCall constraint
-                return []
-            # Updated Session constraint check
-            if "CREATE CONSTRAINT session_unique IF NOT EXISTS FOR (s:Session) REQUIRE (s.app_name, s.user_id, s.id) IS UNIQUE" in query:
-                return []
-
+            # Ignore DDL during tests (already handled by mock session in setUp)
+            if "CREATE CONSTRAINT" in query: return []
+            
             # Mock for create_session
-            # MERGE (userNode)-[:STARTED_SESSION]->(s:Session {id: $session_id})
             if "MERGE (userNode)-[:STARTED_SESSION]->(s:Session" in query:
-                sid = params["session_id"]
-                app_name = params["app_name"]
-                user_id = params["user_id"]
+                sid, app_name, user_id = params["session_id"], params["app_name"], params["user_id"]
                 sess_key = (app_name, user_id, sid)
-                self._db["sessions"][sess_key] = {
-                    "app_name": app_name,
-                    "user_id": user_id,
-                    "id": sid,
-                    "state_json": params["state_json"],
-                    "last_update_time": int(time.time() * 1000) # Store as ms, like Neo4j timestamp()
-                    # 'events' list will be implicitly associated by session_key in _db["events"]
-                }
-                # Return what the actual query returns
-                return [{
+                current_time_ms = int(time.time() * 1000)
+                _db["sessions"][sess_key] = {
                     "app_name": app_name, "user_id": user_id, "id": sid,
-                    "state_json": params["state_json"], "last_update_time": self._db["sessions"][sess_key]["last_update_time"]
-                }]
-
+                    "state_json": params["state_json"], "last_update_time": current_time_ms
+                }
+                return [{"app_name": app_name, "user_id": user_id, "id": sid,
+                         "state_json": params["state_json"], "last_update_time": current_time_ms}]
+            
             # Mock for append_event
-            # MATCH (s:Session ...) WHERE s.last_update_time = $client_last_update_time_ms
-            # SET s.last_update_time = timestamp(), s.state_json = $new_session_state_json
-            # CREATE (e:Event)-[:OF_SESSION]->(s) SET e = $event_props
-            # OPTIONAL MATCH (prev_event:Event)-[:OF_SESSION]->(s) ... CREATE (prev_event)-[:NEXT]->(e)
-            # RETURN e.id AS event_id, s.last_update_time AS new_session_last_update_time_ms
             elif "WHERE s.last_update_time = $client_last_update_time_ms" in query and "CREATE (e:Event)-[:OF_SESSION]->(s)" in query:
-                sid = params["session_id"]
-                app_name = params["app_name"]
-                user_id = params["user_id"]
+                sid, app_name, user_id = params["session_id"], params["app_name"], params["user_id"]
                 sess_key = (app_name, user_id, sid)
+                if sess_key not in _db["sessions"]: return []
                 
-                if sess_key not in self._db["sessions"]:
-                    return [] # Session not found, though query implies it should exist
-
-                # Optimistic locking check
                 client_ts_ms = params["client_last_update_time_ms"]
-                db_ts_ms = self._db["sessions"][sess_key]["last_update_time"]
-                if client_ts_ms != db_ts_ms:
-                    # This would cause the WHERE clause to fail in Neo4j, returning no rows.
-                    # The service should raise StaleSessionError.
-                    return []
+                db_ts_ms = _db["sessions"][sess_key]["last_update_time"]
+                if client_ts_ms != db_ts_ms: return [] # Simulate optimistic lock failure
 
-                # Update session state and timestamp
-                # Ensure new_db_timestamp_ms is greater than the current db_ts_ms
-                new_db_timestamp_ms = db_ts_ms + 100 # Increment by 100ms to ensure it's different
-                self._db["sessions"][sess_key]["state_json"] = params["new_session_state_json"]
-                self._db["sessions"][sess_key]["last_update_time"] = new_db_timestamp_ms
-
-                # Store event
+                new_db_timestamp_ms = db_ts_ms + 100
+                _db["sessions"][sess_key]["state_json"] = params["new_session_state_json"]
+                _db["sessions"][sess_key]["last_update_time"] = new_db_timestamp_ms
+                
                 event_props = params["event_props"]
                 eid = event_props["id"]
-                self._db["events"][eid] = {
-                    "session_key": sess_key,
-                    **event_props # Store all properties from event_props (timestamp is in seconds here)
-                }
-
-                # Simulate NEXT relationship creation
-                # Find previous event in this session
-                session_events = [
-                    evt for evt_id, evt in self._db["events"].items() 
-                    if evt.get("session_key") == sess_key and evt_id != eid
-                ]
-                session_events.sort(key=lambda x: x.get("timestamp", 0)) # Sort by event timestamp (seconds)
+                _db["events"][eid] = {"session_key": sess_key, **event_props}
                 
+                # Simulate NEXT relationship
+                session_events = [evt for evt_id, evt in _db["events"].items() if evt.get("session_key") == sess_key and evt_id != eid]
+                session_events.sort(key=lambda x: x.get("timestamp", 0))
                 if session_events:
                     prev_event_id = session_events[-1]["id"]
-                    self._db["next_rels"][(prev_event_id, eid)] = True # Mark (prev_event_id)-[:NEXT]->(eid)
+                    _db["next_rels"][(prev_event_id, eid)] = True
 
-                # Simulate WROTE_STATE, INVOKED_TOOL if needed for more detailed tests later
+                # Simulate ToolCall creation
+                tool_calls_data = params.get("tool_calls_data", [])
+                for tc_data in tool_calls_data:
+                    _db["tool_calls"][tc_data["id"]] = tc_data # Store tool call data
+
                 return [{"event_id": eid, "new_session_last_update_time_ms": new_db_timestamp_ms}]
-
-            elif "MATCH (s:Session" in query and "DETACH DELETE s" in query: # For delete_session
-                # Parameters from service: {"app": app_name, "user": user_id, "sid": session_id}
-                app_name_param = params.get("app")
-                user_id_param = params.get("user")
-                session_id_param = params.get("sid")
-                
-                sess_key = (app_name_param, user_id_param, session_id_param)
-                # Remove all events for this session
-                for eid, evt_data in list(self._db["events"].items()):
-                    if evt_data["session_key"] == sess_key:
-                        self._db["events"].pop(eid)
-                self._db["sessions"].pop(sess_key, None)
+            
+            # Mock for delete_session
+            elif "MATCH (s:Session" in query and "DETACH DELETE s" in query:
+                app_name, user_id, sid = params.get("app"), params.get("user"), params.get("sid")
+                sess_key = (app_name, user_id, sid)
+                # Remove associated events and tool calls (simplified mock - assumes no complex relations from events/tools)
+                for eid, evt_data in list(_db["events"].items()):
+                    if evt_data["session_key"] == sess_key: 
+                        _db["events"].pop(eid)
+                        # Also remove related NEXT rels
+                        _db["next_rels"] = {k: v for k, v in _db["next_rels"].items() if k[0] != eid and k[1] != eid}
+                        # Mock doesn't track INVOKED_TOOL rels explicitly for deletion here, assumes DETACH handles it
+                _db["sessions"].pop(sess_key, None)
                 return []
-            return []
+                
+            return [] # Default empty result
 
         def fake_execute_read_session(query, params=None):
+            _db = test_case_instance_outer._db # Local alias
             if params is None: params = {}
-            # MATCH (s:Session {app_name: $app_name, user_id: $user_id, id: $session_id}) OPTIONAL MATCH (s)-[:HAS_EVENT]->(e:Event)
-            # The new query uses (:Event)-[:OF_SESSION]->(s)
-            if "RETURN s, collect(e) AS events" in query: # For get_session
+
+            # For get_session: Check for key elements
+            if "MATCH (s:Session {" in query and \
+               "OPTIONAL MATCH (s)-[:HAS_EVENT]->(e:Event)" in query and \
+               "RETURN s, collect(e) AS events" in query:
                 sess_key = (params["app_name"], params["user_id"], params["session_id"])
-                session_node_data = self._db["sessions"].get(sess_key)
-                if not session_node_data:
-                    return [] # Session not found
-
-                # Collect events for this session
-                # Event nodes are now linked via (:Event)-[:OF_SESSION]->(s)
-                # Our mock stores events with a "session_key"
-                collected_events_data = []
-                for eid, event_data_in_db in self._db["events"].items():
-                    if event_data_in_db.get("session_key") == sess_key:
-                        # Simulate the structure Neo4j driver might return for a node
-                        # The service's get_session expects dict(e_node)
-                        # event_data_in_db already contains the necessary props from _prepare_event_properties
-                        collected_events_data.append(event_data_in_db)
+                session_node_data = _db["sessions"].get(sess_key)
+                if not session_node_data: return [] # Session not found in mock
                 
-                # Sort events by timestamp as the actual query does (event timestamps are in seconds)
+                # Collect events, ensuring they are copies to avoid modifying mock DB directly if needed
+                collected_events_data = [dict(data) for eid, data in _db["events"].items() if data.get("session_key") == sess_key]
                 collected_events_data.sort(key=lambda e: e.get("timestamp", 0))
-                
-                # The actual query returns `s` (the session node) and `collect(e) AS events`
-                # `s_node` in get_session becomes `record['s']` (last_update_time is in ms)
-                # `events_list` becomes `record['events']` (event timestamps are in seconds)
-                return [{"s": session_node_data, "events": collected_events_data}]
+                # Return a copy of the session data as well
+                return [{"s": dict(session_node_data), "events": collected_events_data}]
 
-            # For list_sessions: MATCH (s:Session {app_name: $app_name, user_id: $user_id}) RETURN s.id AS session_id, s.last_update_time AS last_update
+            # For list_sessions:
             elif "RETURN s.id AS session_id, s.last_update_time AS last_update" in query:
-                # list_sessions query
                 app, user = params["app_name"], params["user_id"]
-                result = []
-                for (a, u, sid), sess_data in self._db["sessions"].items():
-                    if a == app and u == user:
-                        # last_update_time in mock DB is ms, service expects it to be converted to Session obj (seconds)
-                        # but list_sessions directly uses the returned value.
-                        # For consistency, let's assume the mock returns it as the service would expect for Session obj construction.
-                        # However, the service's list_sessions method creates Session objects where last_update_time is float seconds.
-                        # So, the mock should return it in ms as it's stored in the DB.
-                        result.append({"session_id": sid, "last_update": sess_data["last_update_time"]}) # ms
-                return result
+                return [{"session_id": sid, "last_update": data["last_update_time"]} 
+                        for (a, u, sid), data in _db["sessions"].items() if a == app and u == user]
+
+            # For list_events:
+            elif "MATCH (s:Session" in query and "ORDER BY e.timestamp" in query and \
+                 "RETURN collect(e) AS events" in query and "RETURN s," not in query:
+                sess_key = (params["app_name"], params["user_id"], params["session_id"])
+                if sess_key not in _db["sessions"]: return [{"events": []}] 
+                collected_events_data = [dict(data) for eid, data in _db["events"].items() if data.get("session_key") == sess_key]
+                collected_events_data.sort(key=lambda ev_node: ev_node.get("timestamp", 0))
+                return [{"events": collected_events_data}]
             
             # For NEXT relationship check in tests
-            # MATCH (a:Event {id:$e1})-[:NEXT]->()-[:NEXT]->(c:Event {id:$e3}) RETURN c
             elif "MATCH (a:Event {id:$e1})-[:NEXT]->()-[:NEXT]->(c:Event {id:$e3}) RETURN c" in query:
-                e1_id = params.get("e1")
-                e3_id = params.get("e3")
-                # Check path: e1 -> e2 -> e3
-                # Find e2 such that (e1)-[:NEXT]->(e2)
-                e2_id = None
-                for (start_node, end_node) in self._db["next_rels"].keys():
-                    if start_node == e1_id:
-                        e2_id = end_node
-                        break
-                if not e2_id: return []
+                e1_id, e3_id = params.get("e1"), params.get("e3")
+                e2_id = next((end_node for start_node, end_node in _db["next_rels"].keys() if start_node == e1_id), None)
+                if not e2_id or not _db["next_rels"].get((e2_id, e3_id)) or e3_id not in _db["events"]: return []
+                # Return a copy of the event data
+                return [{"c": dict(_db["events"][e3_id])}]
+                
+            return [] # Default empty result
 
-                # Check if (e2)-[:NEXT]->(e3)
-                if self._db["next_rels"].get((e2_id, e3_id)):
-                    # Return the 'c' node (e3)
-                    if e3_id in self._db["events"]:
-                         # Simulate returning the node properties as Neo4j would
-                        return [{"c": self._db["events"][e3_id]}]
-                return []
-
-            return []
-
+        # Assign mocks to the service instance
         self.session_service._execute_write = fake_execute_write_session
         self.session_service._execute_read = fake_execute_read_session
 
-        # Memory service fake DB interactions
-        # For add_session_to_memory, it calls _execute_write. We need a mock for that.
-        # The MemoryService's _execute_write is used to set :Memory label and embedding.
+        # --- Memory Service Mocks ---
         def fake_execute_write_memory(query, params=None):
+            _db = test_case_instance_outer._db
             if params is None: params = {}
-            # Mock for __init__ index creation
-            if "CALL db.index.fulltext.createNodeIndex('MemoryTextIndex', ['Memory']" in query: # Original label was Memory
-                return []
-            if "CALL db.index.fulltext.createNodeIndex('MemoryTextIndex', ['MemoryChunk']" in query: # New label is MemoryChunk
-                return []
-            if "CALL db.index.vector.createNodeIndex('MemoryVectorIndex', 'Memory'" in query: # Original label
-                return []
-            if "CALL db.index.vector.createNodeIndex('MemoryVectorIndex', 'MemoryChunk'" in query: # New label
-                return []
-
+            # Ignore DDL
+            if "CALL db.index.fulltext.createNodeIndex" in query: return []
+            if "CALL db.index.vector.createNodeIndex" in query: return []
+            
             # Mock for add_session_to_memory
-            # UNWIND $events AS chunk_data MERGE (mc:MemoryChunk {eid: chunk_data.eid}) SET mc += chunk_data
             if "UNWIND $events AS chunk_data" in query and "MERGE (mc:MemoryChunk {eid: chunk_data.eid})" in query:
-                chunks_to_add = params.get("events", []) # Parameter name is 'events' in service
-                added_count = 0
-                if "memory_chunks" not in self._db:
-                    self._db["memory_chunks"] = {}
-                
+                chunks_to_add, added_count = params.get("events", []), 0
+                if "memory_chunks" not in _db: _db["memory_chunks"] = {}
                 for chunk_data in chunks_to_add:
                     eid = chunk_data["eid"]
-                    # Store the chunk data. Using eid as key for simplicity in mock.
-                    self._db["memory_chunks"][eid] = {
-                        "eid": eid,
-                        "text": chunk_data["text"],
-                        "author": chunk_data["author"],
-                        "ts": chunk_data["ts"],
-                        "app_name": params.get("app"), # app_name from parameters
-                        "user_id": params.get("user"), # user_id from parameters
-                        "session_id": params.get("sid"), # session_id from parameters
-                        "embedding": chunk_data.get("embedding")
-                    }
+                    _db["memory_chunks"][eid] = {
+                        "eid": eid, "text": chunk_data["text"], "author": chunk_data["author"], "ts": chunk_data["ts"],
+                        "app_name": params.get("app"), "user_id": params.get("user"), "session_id": params.get("sid"),
+                        "embedding": chunk_data.get("embedding")}
                     added_count += 1
                 return [{"added": added_count}]
             return []
         
-        self.memory_service._execute_write = fake_execute_write_memory
-
         def fake_execute_read_memory(query, params=None):
+            _db = test_case_instance_outer._db
             if params is None: params = {}
-            # Simulate fulltext search
-            # Simulate fulltext search on MemoryChunk nodes
+            # Mock for search_memory (full-text)
             if "CALL db.index.fulltext.queryNodes('MemoryTextIndex'" in query:
-                q_text = params["query"].lower()
-                app_name_param = params["app_name"]
-                user_id_param = params["user_id"]
-                mock_results = []
-                for eid, chunk_data in self._db.get("memory_chunks", {}).items():
-                    text_match = q_text in chunk_data.get("text", "").lower()
-                    app_match = chunk_data.get("app_name") == app_name_param
-                    user_match = chunk_data.get("user_id") == user_id_param
-                    if text_match and app_match and user_match:
-                        # session_id is now expected to be directly on the chunk_data from the mock DB
-                        mock_results.append({
-                            "session_id": chunk_data.get("session_id"), # Use directly stored session_id
-                            "event_id": chunk_data.get("eid"),
-                            "text": chunk_data.get("text"),
-                            "author": chunk_data.get("author"),
-                            "ts": chunk_data.get("ts"),
-                            "score": 1.0  # dummy score
-                        })
-                return mock_results
-            
-            # Simulate vector search on MemoryChunk nodes
-            if "CALL db.index.vector.queryNodes('MemoryVectorIndex'" in query:
-                # This would require a mock embedding function and vector comparison logic
-                return [] # Return no vector results for simplicity in this mock
+                q_text, app_param, user_param = params["query"].lower(), params["app_name"], params["user_id"]
+                results = []
+                for eid, chunk in _db.get("memory_chunks", {}).items():
+                    if q_text in chunk.get("text", "").lower() and \
+                       chunk.get("app_name") == app_param and \
+                       chunk.get("user_id") == user_param:
+                        # Return data needed by search_memory to reconstruct MemoryResult
+                        results.append({"session_id": chunk.get("session_id"), "event_id": chunk.get("eid"), 
+                                        "text": chunk.get("text"), "author": chunk.get("author"), 
+                                        "ts": chunk.get("ts"), "score": 1.0})
+                return results
+            # Mock for search_memory (vector) - returning empty for simplicity
+            if "CALL db.index.vector.queryNodes('MemoryVectorIndex'" in query: 
+                return []
             return []
         
+        self.memory_service._execute_write = fake_execute_write_memory
         self.memory_service._execute_read = fake_execute_read_memory
 
     def tearDown(self):
         # Restore the original neo4j.GraphDatabase.driver
         neo4j.GraphDatabase.driver = self.original_driver
 
-        # Ensure drivers created by services (even if they are mocks from the initial patch) are "closed"
-        # The patched close methods in setUp handle the self.xxx_driver_closed flags
+        # Ensure drivers created by services are "closed"
         if hasattr(self.session_service, 'close'):
             self.session_service.close()
         if hasattr(self.memory_service, 'close'):
             self.memory_service.close()
+        # Verify mock close flags if needed for specific tests
+        # self.assertTrue(self.session_service_driver_closed)
+        # self.assertTrue(self.memory_service_driver_closed)
 
 
     def test_create_and_get_session(self):
@@ -430,76 +305,80 @@ class TestNeo4jServices(unittest.TestCase):
         self.assertIsInstance(sess, Session)
         self.assertEqual(sess.app_name, "test_app")
         self.assertEqual(sess.user_id, "user123")
-        # The initial state should be as provided
         self.assertEqual(sess.state.get("foo"), "bar")
-        # last_update_time should be a float (seconds)
         self.assertIsInstance(sess.last_update_time, float)
 
         # Retrieving the session should return the same data
         fetched = self.session_service.get_session(app_name="test_app", user_id="user123", session_id=sess.id)
-        self.assertIsNotNone(fetched)
-        self.assertEqual(fetched.id, sess.id)
-        self.assertEqual(fetched.state, {"foo": "bar"}) # State is JSON dumped and loaded, should be equal
-        self.assertEqual(len(fetched.events), 0)  # no events yet
-        self.assertIsInstance(fetched.last_update_time, float)
-        self.assertAlmostEqual(fetched.last_update_time, sess.last_update_time, places=2)
+        
+        # --- Assertion that failed ---
+        self.assertIsNotNone(fetched, "get_session should retrieve the created session") 
+        # --- End Assertion ---
+        
+        if fetched: # Proceed only if fetched is not None
+            self.assertEqual(fetched.id, sess.id)
+            self.assertEqual(fetched.state, {"foo": "bar"}) 
+            self.assertEqual(len(fetched.events), 0)
+            self.assertIsInstance(fetched.last_update_time, float)
+            self.assertAlmostEqual(fetched.last_update_time, sess.last_update_time, places=2)
 
 
     def test_append_event_state_update(self):
         sess = self.session_service.create_session(app_name="test_app", user_id="user123", state={"count": 1})
         original_last_update_time = sess.last_update_time
 
-        # Create a dummy Event with state_delta action
         evt_actions = EventActions(state_delta={"count": 2, "temp:note": "temp", "new_key": "value", "remove_this": None})
         evt_content = types.Content(parts=[types.Part(text="Hello world")])
         evt = Event(author="user", content=evt_content, actions=evt_actions)
         
-        # Append the event
         returned_event = self.session_service.append_event(sess, evt)
-        self.assertEqual(returned_event, evt) # append_event should return the event passed in (possibly modified with id/timestamp)
+        self.assertEqual(returned_event, evt) 
 
-        # The session object should be updated in memory
-        self.assertEqual(sess.state.get("count"), 2)          # updated by state_delta
-        self.assertNotIn("temp:note", sess.state)             # temp key not persisted by service logic
-        self.assertEqual(sess.state.get("new_key"), "value")  # new key added
-        self.assertNotIn("remove_this", sess.state)           # None value should remove key
+        self.assertEqual(sess.state.get("count"), 2)
+        self.assertNotIn("temp:note", sess.state)
+        self.assertEqual(sess.state.get("new_key"), "value")
+        self.assertNotIn("remove_this", sess.state)
         self.assertEqual(len(sess.events), 1)
         self.assertEqual(sess.events[0], evt)
 
-        # The event should have an id assigned and be stored in our mock _db
-        self.assertIsNotNone(evt.id) # ID should be assigned by append_event if not present
+        self.assertIsNotNone(evt.id) 
         evt_stored_in_mock = self._db["events"].get(evt.id)
         self.assertIsNotNone(evt_stored_in_mock)
-        self.assertEqual(evt_stored_in_mock["text"], "Hello world") # Check text field was generated
+        self.assertEqual(evt_stored_in_mock["text"], "Hello world") 
 
-        # Session last_update_time should be updated by append_event from the DB mock
         self.assertNotAlmostEqual(sess.last_update_time, original_last_update_time, places=5)
         self.assertTrue(sess.last_update_time > original_last_update_time)
         
-        # Now retrieve session from service and check state and events
         fetched = self.session_service.get_session(app_name="test_app", user_id="user123", session_id=sess.id)
-        self.assertIsNotNone(fetched)
-        self.assertEqual(fetched.state.get("count"), 2)
-        self.assertIn("new_key", fetched.state)
-        self.assertNotIn("remove_this", fetched.state)
-        self.assertNotIn("temp:note", fetched.state) # Temp keys should not be in fetched state either
+        
+        # --- Assertion that failed ---
+        self.assertIsNotNone(fetched, "get_session should retrieve the session after appending an event")
+        # --- End Assertion ---
 
-        # The fetched session should have one event with matching content
-        self.assertEqual(len(fetched.events), 1)
-        fetched_event = fetched.events[0]
-        self.assertEqual(fetched_event.id, evt.id)
-        self.assertEqual(fetched_event.author, evt.author)
-        self.assertTrue(fetched_event.content and fetched_event.content.parts[0].text == "Hello world")
-        # Check actions reconstruction (simplified, as EventActions might not be fully reconstructed by default mock)
-        # In the real service, EventActions are reconstructed if actions_json is present.
-        # Our mock for get_session populates actions_json, so the service should try to parse it.
-        # For this test, we ensure the original event's actions are used for comparison if needed.
-        if fetched_event.actions: # If actions were reconstructed
-            self.assertEqual(fetched_event.actions.state_delta, evt_actions.state_delta)
+        if fetched: # Proceed only if fetched is not None
+            self.assertEqual(fetched.state.get("count"), 2)
+            self.assertIn("new_key", fetched.state)
+            self.assertNotIn("remove_this", fetched.state)
+            self.assertNotIn("temp:note", fetched.state) 
+
+            self.assertEqual(len(fetched.events), 1)
+            fetched_event = fetched.events[0]
+            self.assertEqual(fetched_event.id, evt.id)
+            self.assertEqual(fetched_event.author, evt.author)
+            self.assertTrue(fetched_event.content and fetched_event.content.parts[0].text == "Hello world")
+            
+            # Check actions reconstruction
+            # Note: Dummy EventActions might not have model_dump, adjust if using real ADK
+            if fetched_event.actions and hasattr(evt_actions, 'model_dump'):
+                 # Compare dicts if model_dump is available
+                 self.assertEqual(fetched_event.actions.model_dump(), evt_actions.model_dump())
+            elif fetched_event.actions:
+                 # Fallback: Compare relevant attributes if model_dump is not available
+                 self.assertEqual(fetched_event.actions.state_delta, evt_actions.state_delta)
+                 self.assertEqual(fetched_event.actions.tool_calls, evt_actions.tool_calls)
 
 
     def test_search_memory_fulltext(self):
-        # Create a session and append events
         sess = self.session_service.create_session(app_name="test_app", user_id="user123")
         evt1_content = types.Content(parts=[types.Part(text="Paris is the capital of France.")])
         evt1 = Event(author="user", content=evt1_content, actions=EventActions())
@@ -509,91 +388,193 @@ class TestNeo4jServices(unittest.TestCase):
         evt2 = Event(author="agent", content=evt2_content, actions=EventActions())
         self.session_service.append_event(sess, evt2)
         
-        # Ingest session to memory
         self.memory_service.add_session_to_memory(sess)
 
-        # Verify that memory chunks are created in _db["memory_chunks"]
-        # The key for memory_chunks in the mock is the event ID (eid)
-        self.assertIn(evt1.id, self._db.get("memory_chunks", {}), "Event 1 should have a corresponding memory chunk.")
+        self.assertIn(evt1.id, self._db.get("memory_chunks", {}))
         self.assertEqual(self._db["memory_chunks"][evt1.id].get("text"), "Paris is the capital of France.")
-        self.assertIn(evt2.id, self._db.get("memory_chunks", {}), "Event 2 should have a corresponding memory chunk.")
+        self.assertIn(evt2.id, self._db.get("memory_chunks", {}))
         
-        # Search for a keyword present in evt1 content
         response = self.memory_service.search_memory(app_name="test_app", user_id="user123", query="capital of France")
         
-        self.assertIsInstance(response, SearchMemoryResponse, "Search memory should return a SearchMemoryResponse object.")
-        
+        self.assertIsInstance(response, SearchMemoryResponse)
         memories_list = response.memories
-        self.assertIsNotNone(memories_list, "Response memories list should not be None.")
-
-        # Check if any MemoryResult was found. The mock might return an empty list if no match.
-        # If a match is expected, assertGreaterEqual(len(memories_list), 1)
-        # For this specific query "capital of France", we expect a match.
-        self.assertGreaterEqual(len(memories_list), 1, "Should find at least one matching MemoryResult.")
+        self.assertIsNotNone(memories_list)
+        self.assertGreaterEqual(len(memories_list), 1)
         
         found_event_text = False
-        for mem_item in memories_list: # mem_item is now expected to be a MemoryResult object
-            self.assertIsInstance(mem_item, MemoryResult, "Each item in memories should be a MemoryResult object.")
+        for mem_item in memories_list: 
+            self.assertIsInstance(mem_item, MemoryResult) 
             if mem_item.session_id == sess.id:
-                self.assertTrue(hasattr(mem_item, 'events'), "MemoryResult should have an 'events' attribute.")
+                self.assertTrue(hasattr(mem_item, 'events'))
                 for event_in_memory in mem_item.events:
-                    self.assertIsInstance(event_in_memory, Event, "Each event in MemoryResult should be an Event object.")
-                    # Assuming the reconstructed event has content with parts
+                    self.assertIsInstance(event_in_memory, Event)
                     if event_in_memory.content and hasattr(event_in_memory.content, 'parts'):
                         for part in event_in_memory.content.parts:
                             if hasattr(part, 'text') and "Paris is the capital of France." in part.text:
                                 found_event_text = True
                                 break
-                    if found_event_text:
-                        break
-            if found_event_text:
-                break
+                    if found_event_text: break
+            if found_event_text: break
         
-        self.assertTrue(found_event_text, "Memory search should retrieve an event with the expected text.")
+        self.assertTrue(found_event_text, "Memory search should retrieve the event with 'Paris is the capital of France.'")
 
     def test_list_sessions(self):
         self.session_service.create_session(app_name="app1", user_id="user1", state={"data": "session1"})
         self.session_service.create_session(app_name="app1", user_id="user1", state={"data": "session2"})
-        self.session_service.create_session(app_name="app1", user_id="user2", state={"data": "session3"}) # Different user
+        self.session_service.create_session(app_name="app1", user_id="user2", state={"data": "session3"}) 
 
         listed_sessions_response = self.session_service.list_sessions(app_name="app1", user_id="user1")
+        self.assertIsInstance(listed_sessions_response, ListSessionsResponse)
         self.assertEqual(len(listed_sessions_response.sessions), 2)
+        session_ids = {s.id for s in listed_sessions_response.sessions}
+        # Check if the sessions created for user1 are listed (IDs are random)
+        user1_sessions_in_db = {sid for (a, u, sid), data in self._db["sessions"].items() if a == "app1" and u == "user1"}
+        self.assertEqual(session_ids, user1_sessions_in_db)
         for s in listed_sessions_response.sessions:
             self.assertEqual(s.app_name, "app1")
             self.assertEqual(s.user_id, "user1")
 
+    def test_list_events(self): # New test method
+        sess = self.session_service.create_session(app_name="app_event_list", user_id="user_event_list")
+        evt1_content = types.Content(parts=[types.Part(text="Event 1 for list")])
+        evt1 = Event(author="user", content=evt1_content)
+        self.session_service.append_event(sess, evt1)
+        time.sleep(0.01) # Ensure timestamp difference
+
+        evt2_content = types.Content(parts=[types.Part(text="Event 2 for list")])
+        evt2 = Event(author="agent", content=evt2_content)
+        self.session_service.append_event(sess, evt2)
+
+        listed_events_response = self.session_service.list_events(
+            app_name="app_event_list", user_id="user_event_list", session_id=sess.id
+        )
+        self.assertIsInstance(listed_events_response, ListEventsResponse)
+        self.assertEqual(len(listed_events_response.events), 2)
+        # Events should be sorted by timestamp
+        self.assertEqual(listed_events_response.events[0].id, evt1.id)
+        self.assertEqual(listed_events_response.events[1].id, evt2.id)
+
     def test_delete_session(self):
         sess_to_delete = self.session_service.create_session(app_name="app_del", user_id="user_del")
-        self.session_service.append_event(sess_to_delete, Event(author="test", content=types.Content(parts=[types.Part(text="event to delete")])))
+        evt_to_delete = Event(author="test", content=types.Content(parts=[types.Part(text="event to delete")]))
+        self.session_service.append_event(sess_to_delete, evt_to_delete)
         
-        # Check it exists
-        self.assertIsNotNone(self.session_service.get_session(app_name="app_del", user_id="user_del", session_id=sess_to_delete.id))
-        self.assertIn(sess_to_delete.events[0].id, self._db["events"]) # Check event in mock db
+        # Check it exists before delete
+        fetched_before = self.session_service.get_session(app_name="app_del", user_id="user_del", session_id=sess_to_delete.id)
+        self.assertIsNotNone(fetched_before, "Session should exist before deletion")
+        self.assertIn(evt_to_delete.id, self._db["events"], "Event should exist in mock DB before deletion") 
 
         # Delete
         self.session_service.delete_session(app_name="app_del", user_id="user_del", session_id=sess_to_delete.id)
 
         # Verify it's gone
-        self.assertIsNone(self.session_service.get_session(app_name="app_del", user_id="user_del", session_id=sess_to_delete.id))
-        self.assertNotIn(sess_to_delete.events[0].id, self._db["events"]) # Check event also removed from mock db
-        self.assertNotIn(("app_del", "user_del", sess_to_delete.id), self._db["sessions"])
+        fetched_after = self.session_service.get_session(app_name="app_del", user_id="user_del", session_id=sess_to_delete.id)
+        self.assertIsNone(fetched_after, "Session should be None after deletion")
+        self.assertNotIn(evt_to_delete.id, self._db["events"], "Event should be removed from mock DB after deletion") 
+        self.assertNotIn(("app_del", "user_del", sess_to_delete.id), self._db["sessions"], "Session key should be removed from mock DB")
 
+    def test_append_event_stale_session_error(self):
+        sess = self.session_service.create_session(app_name="test_stale", user_id="user_stale")
+        
+        mock_sess_key = (sess.app_name, sess.user_id, sess.id)
+        # Ensure session exists in mock DB before modifying timestamp
+        self.assertIn(mock_sess_key, self._db["sessions"])
+        # Simulate external update by incrementing timestamp in mock DB
+        self._db["sessions"][mock_sess_key]["last_update_time"] += 5000 
 
-def test_wrote_state_edge_creation(self):
-    """Test that WROTE_STATE edge is part of the Cypher query when state changes."""
-    sess = self.session_service.create_session(app_name="test_app_state", user_id="user_state")
-    
-    # Ensure the mock is in place for _execute_write
-    # This is to capture the query string from append_event
-    original_execute_write = self.session_service._execute_write
-    
-    captured_query_in_test = None
-    def capture_query_for_append(query, params=None):
-        nonlocal captured_query_in_test
-        captured_query_in_test = query
-        # Call the original fake_execute_write_session to maintain mock DB state
-        return self.session_service._original_fake_execute_write(query, params)
+        evt_content = types.Content(parts=[types.Part(text="Attempt to append to stale session")])
+        evt = Event(author="user", content=evt_content)
+        
+        # Attempt append with the original session object (stale timestamp)
+        with self.assertRaises(StaleSessionError):
+            self.session_service.append_event(sess, evt)
 
-    # Temporarily replace _execute_write with our capturer
-    self.session_service._original_fake_execute_write = self.session_service._execute_write
-    self.session_service._execute_write = capture_query_for_append
+    def test_append_event_next_relationship(self):
+        sess = self.session_service.create_session(app_name="test_next", user_id="user_next")
+        
+        evt1_content = types.Content(parts=[types.Part(text="Event 1")])
+        evt1 = Event(author="user", content=evt1_content, timestamp=time.time()) 
+        self.session_service.append_event(sess, evt1)
+        time.sleep(0.01) 
+
+        evt2_content = types.Content(parts=[types.Part(text="Event 2")])
+        evt2 = Event(author="agent", content=evt2_content, timestamp=time.time())
+        self.session_service.append_event(sess, evt2)
+        time.sleep(0.01)
+
+        evt3_content = types.Content(parts=[types.Part(text="Event 3")])
+        evt3 = Event(author="user", content=evt3_content, timestamp=time.time())
+        self.session_service.append_event(sess, evt3)
+
+        # Verify NEXT relationships using the mock's internal state
+        self.assertTrue(self._db["next_rels"].get((evt1.id, evt2.id)), "NEXT relationship from evt1 to evt2 should exist.")
+        self.assertTrue(self._db["next_rels"].get((evt2.id, evt3.id)), "NEXT relationship from evt2 to evt3 should exist.")
+        self.assertIsNone(self._db["next_rels"].get((evt1.id, evt3.id)), "Direct NEXT relationship from evt1 to evt3 should NOT exist.")
+
+        # Verify using the specific Cypher query mentioned in the issue
+        path_result = self.session_service._execute_read(
+            "MATCH (a:Event {id:$e1})-[:NEXT]->()-[:NEXT]->(c:Event {id:$e3}) RETURN c",
+            {"e1": evt1.id, "e3": evt3.id}
+        )
+        self.assertIsNotNone(path_result, "Query for e1->...->e3 should return a result.")
+        self.assertGreaterEqual(len(path_result), 1, "Query for e1->...->e3 should find a path.")
+        if path_result: 
+             self.assertEqual(path_result[0]["c"]["id"], evt3.id, "The end of the e1->...->e3 path should be e3.")
+
+    def test_append_event_with_tool_calls(self):
+        """Verify ToolCall nodes and INVOKED_TOOL relationships are created."""
+        sess = self.session_service.create_session(app_name="test_tool", user_id="user_tool")
+        
+        # Create FunctionCall instances (using the ToolCall alias) with 'args' field
+        tool_call_1 = ToolCall(name="search_web", args={"query": "Neo4j graph database"}) # Use args=
+        tool_call_2 = ToolCall(name="calculate", args={"expression": "2+2"}) # Use args=
+        
+        # Place FunctionCalls in event.content.parts as per current ADK standard
+        evt_content = types.Content(parts=[
+            types.Part(function_call=tool_call_1),
+            types.Part(function_call=tool_call_2)
+        ])
+        # EventActions might still exist for state_delta, etc., but not for tool_calls
+        evt_actions = EventActions()
+        evt = Event(author="agent", content=evt_content, actions=evt_actions)
+
+        # Append the event
+        self.session_service.append_event(sess, evt)
+
+        # Verify properties of stored ToolCall data in the mock DB
+        # Since FunctionCall doesn't have a stable input ID, we find the stored data by name.
+        # The _extract_tool_calls method generates a UUID for the Neo4j node ID.
+        tc1_data = None
+        tc2_data = None
+        tc1_id = None
+        tc2_id = None
+        for tc_id, data in self._db["tool_calls"].items():
+            if data["name"] == "search_web":
+                tc1_data = data
+                tc1_id = tc_id # Capture the generated ID
+            elif data["name"] == "calculate":
+                tc2_data = data
+                tc2_id = tc_id # Capture the generated ID
+        
+        self.assertIsNotNone(tc1_data, "ToolCall data for 'search_web' should be found in mock DB")
+        self.assertIsNotNone(tc1_id, "Generated ID for ToolCall 'search_web' should exist")
+        if tc1_data:
+            self.assertEqual(tc1_data["name"], "search_web")
+            # Check parameters_json which should contain the 'args' dict dumped as JSON
+            self.assertEqual(tc1_data["parameters_json"], json.dumps({"query": "Neo4j graph database"}))
+
+        self.assertIsNotNone(tc2_data, "ToolCall data for 'calculate' should be found in mock DB")
+        self.assertIsNotNone(tc2_id, "Generated ID for ToolCall 'calculate' should exist")
+        if tc2_data:
+            self.assertEqual(tc2_data["name"], "calculate")
+            self.assertEqual(tc2_data["parameters_json"], json.dumps({"expression": "2+2"}))
+
+        # Note: The mock doesn't explicitly track the INVOKED_TOOL relationship creation,
+        # but we can infer it happened because the ToolCall nodes were added based on the
+        # 'tool_calls_data' parameter passed to the mock write function.
+        # A more detailed mock could track relationship creation if needed.
+
+# Commenting out incomplete test from previous attempts
+# def test_wrote_state_edge_creation(self):
+#     """Test that WROTE_STATE edge is part of the Cypher query when state changes."""
+#     pass

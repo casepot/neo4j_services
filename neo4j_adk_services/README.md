@@ -6,7 +6,7 @@ This package provides Neo4j-backed implementations for the Session and Memory se
 
 The core components are:
 
-*   **`Neo4jSessionService`**: A service that stores ADK session and event data in Neo4j. It extends `google.adk.sessions.BaseSessionService` and implements a rich graph model to capture not just session state but also the relationships between users, sessions, events, tool calls, and state changes.
+*   **`Neo4jSessionService`**: A service that stores ADK session and event data in Neo4j. It extends `google.adk.sessions.BaseSessionService` and implements a rich graph model to capture not just session state but also the relationships between users, sessions, events, function calls (persisted as `:ToolCall` nodes), and state changes.
 *   **`Neo4jMemoryService`**: A service for long-term memory storage and retrieval using Neo4j. It extends `google.adk.memory.BaseMemoryService` and supports both full-text and vector similarity searches over stored conversation events (represented as `MemoryChunk` nodes).
 *   **`metric_helpers.py`** (Optional): Contains a `Metric` dataclass that can be used to model and store performance metrics (e.g., latency, token counts) associated with events.
 
@@ -22,8 +22,8 @@ The services are designed to create a rich, interconnected graph in Neo4j, rathe
     *   `App`: Represents an application using the ADK.
     *   `User`: Represents an end-user interacting with the application.
     *   `Session`: Represents a single conversation or interaction session.
-    *   `Event`: Represents an individual event within a session (e.g., user message, agent response, tool call).
-    *   `ToolCall`: Represents an invocation of an external tool during an event.
+    *   `Event`: Represents an individual event within a session (e.g., user message, agent response, function call). Note: Function calls are typically found within the `event.content`.
+    *   `ToolCall`: Represents an invocation of an external tool/function during an event, persisted as a distinct node in Neo4j for analysis. Data is extracted from `google.genai.types.FunctionCall` objects found in the event content.
     *   `MemoryChunk`: Represents a piece of information (derived from an event) stored for long-term memory.
     *   `Metric` (Optional): Represents a performance or usage metric associated with an event.
 *   **Relationships:**
@@ -31,7 +31,7 @@ The services are designed to create a rich, interconnected graph in Neo4j, rathe
     *   `(:Event)-[:OF_SESSION]->(:Session)`: Links an event to its parent session.
     *   `(:Event)-[:NEXT]->(:Event)`: Creates a chronological chain of events within a session for efficient timeline traversal.
     *   `(:Event)-[:WROTE_STATE {key, fromValue_json, toValue_json, timestamp}]->(:Session)`: Records changes to the session state, linking the event that caused the change to the session. It stores the key, previous value (as JSON), new value (as JSON), and timestamp of the change.
-    *   `(:Event)-[:INVOKED_TOOL]->(:ToolCall)`: Links an event to any tools it invoked.
+    *   `(:Event)-[:INVOKED_TOOL]->(:ToolCall)`: Links an event (specifically, the one containing the `FunctionCall` in its content) to the corresponding `:ToolCall` node representing that invocation.
     *   `(:Metric)-[:FOR_EVENT]->(:Event)` (Optional): Links a metric to the event it pertains to.
     *   `(:MemoryChunk)-[:SIMILAR {score}]->(:MemoryChunk)` (Conceptual): Represents semantic similarity between memory chunks. This relationship is intended to be populated offline, for example, using Neo4j Graph Data Science (GDS) k-NN algorithms.
 
@@ -39,7 +39,7 @@ The services are designed to create a rich, interconnected graph in Neo4j, rathe
 *   **Session Management**: Creates and retrieves sessions, linking them to `App` and `User` nodes.
 *   **Event Persistence**: Appends events to sessions, automatically creating `NEXT` relationships to maintain order.
 *   **State Change Tracking**: For every persisted key in `event.actions.state_delta`, a `WROTE_STATE` relationship is created from the `Event` to the `Session`, capturing the key, old value (if available and simple), new value, and timestamp.
-*   **Tool Call Tracking**: If an event involves tool calls (as per `event.actions.tool_calls`), corresponding `ToolCall` nodes are created and linked to the event via `INVOKED_TOOL`.
+*   **Tool Call Tracking**: If an event's content contains `google.genai.types.FunctionCall` objects (retrieved via `event.get_function_calls()`), corresponding `:ToolCall` nodes are created in Neo4j with relevant details (name, arguments as JSON). These nodes are linked from the event via `INVOKED_TOOL` relationships.
 *   **Ephemeral State Handling**: Keys prefixed with `"temp:"` in `state_delta` are not persisted, aligning with ADK conventions.
 *   **Optimistic Locking**: When appending events, the service checks `Session.last_update_time` (converted to milliseconds) against the database version to prevent stale writes. If a mismatch occurs, a `StaleSessionError` is raised.
 
@@ -73,13 +73,13 @@ The services are designed to create a rich, interconnected graph in Neo4j, rathe
     *   `content_json`: (string, JSON representation of `event.content`)
     *   `actions_json`: (string, JSON representation of `event.actions`)
     *   `text`: (string, textual summary of content for search)
-*   **`ToolCall`**:
-    *   `id`: (string, unique tool call identifier)
-    *   `name`: (string, name of the tool)
-    *   `parameters_json`: (string, JSON representation of tool parameters)
-    *   `latency_ms`: (integer, optional)
-    *   `status`: (string, optional)
-    *   `error_msg`: (string, optional)
+*   **`ToolCall`** (Neo4j Node representing a function/tool invocation):
+    *   `id`: (string, unique identifier generated by the service for the node)
+    *   `name`: (string, name of the function/tool, from `FunctionCall.name`)
+    *   `parameters_json`: (string, JSON representation of function arguments, from `FunctionCall.args`)
+    *   `latency_ms`: (integer, optional - *Note: Not directly available from `FunctionCall`*)
+    *   `status`: (string, optional - *Note: Not directly available from `FunctionCall`*)
+    *   `error_msg`: (string, optional - *Note: Not directly available from `FunctionCall`*)
 *   **`MemoryChunk`**:
     *   `eid`: (string, ID of the original event this chunk is derived from)
     *   `text`: (string, textual content for search and recall)
@@ -313,7 +313,7 @@ memory_service.close()
 ## Key Design Decisions & References
 *   **Event Timeline with `NEXT`**: Inspired by temporal graph patterns for efficient ordered traversals. ([Neo4j Docs: Variable-length patterns](https://neo4j.com/docs/cypher-manual/current/patterns/variable-length-patterns/))
 *   **State Lineage with `WROTE_STATE`**: Captures the history of state changes, allowing for audit trails and debugging. ([Stack Overflow: Neo4j strategy to keep history](https://stackoverflow.com/questions/22073512/neo4j-strategy-to-keep-history-of-node-changes))
-*   **`ToolCall` Nodes**: Treats tool invocations as first-class citizens, enabling analysis of tool usage, performance, and failure rates.
+*   **`ToolCall` Nodes**: Persists tool/function invocations (extracted from `google.genai.types.FunctionCall` objects in event content) as distinct `:ToolCall` nodes in Neo4j. This enables graph-based analysis of tool usage patterns, even though the ADK event structure itself has evolved.
 *   **`DETACH DELETE`**: Used for `delete_session` to ensure cascading deletion of all related nodes and relationships. ([Neo4j Docs: Delete](https://neo4j.com/docs/cypher-manual/current/clauses/delete/#delete-delete-nodes-and-their-relationships))
 *   **Constraints and Indexes**: Essential for data integrity and query performance. ([Neo4j Docs: Constraints](https://neo4j.com/docs/cypher-manual/current/constraints/syntax/), [Neo4j Docs: Full-text indexes](https://neo4j.com/docs/cypher-manual/current/indexes/semantic-indexes/full-text-indexes/), [Neo4j Docs: Vector indexes](https://neo4j.com/docs/cypher-manual/current/indexes/semantic-indexes/vector-indexes/))
 *   **APOC for JSON conversion in Cypher**: `apoc.convert.toJson()` is used in `WROTE_STATE` relationships to store complex `fromValue` and `toValue` as JSON strings. Ensure APOC plugin is installed in Neo4j.
