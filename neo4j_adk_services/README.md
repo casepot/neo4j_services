@@ -41,6 +41,7 @@ The services are designed to create a rich, interconnected graph in Neo4j, rathe
 *   **State Change Tracking**: For every persisted key in `event.actions.state_delta`, a `WROTE_STATE` relationship is created from the `Event` to the `Session`, capturing the key, old value (if available and simple), new value, and timestamp.
 *   **Tool Call Tracking**: If an event involves tool calls (as per `event.actions.tool_calls`), corresponding `ToolCall` nodes are created and linked to the event via `INVOKED_TOOL`.
 *   **Ephemeral State Handling**: Keys prefixed with `"temp:"` in `state_delta` are not persisted, aligning with ADK conventions.
+*   **Optimistic Locking**: When appending events, the service checks `Session.last_update_time` (converted to milliseconds) against the database version to prevent stale writes. If a mismatch occurs, a `StaleSessionError` is raised.
 
 ### Neo4jMemoryService
 *   **Memory Ingestion**: Stores relevant information from session events as distinct `MemoryChunk` nodes. Each `MemoryChunk` typically contains the text content, author, timestamp, the ID of the original event (`eid`), and the `session_id` it belongs to. It also stores `app_name` and `user_id` for partitioned search.
@@ -63,7 +64,7 @@ The services are designed to create a rich, interconnected graph in Neo4j, rathe
     *   `app_name`: (string)
     *   `user_id`: (string)
     *   `state_json`: (string, JSON representation of the session state)
-    *   `last_update_time`: (float, timestamp)
+    *   `last_update_time`: (integer, millisecond Unix epoch timestamp for optimistic locking in DB; float seconds in Python `Session` object)
 *   **`Event`**:
     *   `id`: (string, unique event identifier)
     *   `author`: (string, e.g., "user", "agent", "tool")
@@ -196,6 +197,11 @@ user_sessions = session_service.list_sessions(
 )
 # list_sessions returns a ListSessionsResponse object
 print(f"User user123 has {len(user_sessions.sessions)} sessions.")
+
+# If append_event is called with a session object whose last_update_time
+# does not match the one in the database (e.g., due to a concurrent update),
+# a StaleSessionError will be raised. Callers should catch this and can
+# retry the operation after re-fetching the session.
 
 # ... (other operations like list_events, delete_session)
 

@@ -7,6 +7,13 @@ import json # For _extract_tool_calls and _encode_event
 import uuid # For _extract_tool_calls
 import time # For _encode_event and create_session
 
+
+# Custom exception for optimistic locking failures
+class StaleSessionError(Exception):
+    """Raised when a session update is attempted on a stale version of the session."""
+    pass
+
+
 class Neo4jSessionService(BaseSessionService):
     """A SessionService implementation backed by Neo4j graph database."""
     def __init__(self, uri: str, user: str, password: str, database: str = None):
@@ -44,12 +51,13 @@ class Neo4jSessionService(BaseSessionService):
         
         initial_state = state or {}
         state_json = json.dumps(initial_state)
-        current_timestamp = time.time()
+        # current_timestamp = time.time() # Will use Neo4j's timestamp()
 
         # Cypher query adapted from patch, creating App, User, and Session with relationship
         # Assuming app_name is the key for App node and user_id for User node.
         # $app_delta and $user_delta are not used here as we are creating, not updating App/User nodes.
         # The patch implies MERGE for App and User, which is good practice.
+        # s.last_update_time will be set by Neo4j's timestamp() in milliseconds.
         query = """
         MERGE (app:App {name: $app_name})
         MERGE (userNode:User {id: $user_id}) // Assuming 'id' is the property for userNode
@@ -58,27 +66,31 @@ class Neo4jSessionService(BaseSessionService):
             s.app_name = $app_name,
             s.user_id = $user_id,
             s.state_json = $state_json,
-            s.last_update_time = $timestamp
+            s.last_update_time = timestamp() // Use Neo4j's timestamp for milliseconds
         RETURN s.app_name AS app_name, s.user_id AS user_id, s.id AS id, s.state_json AS state_json, s.last_update_time AS last_update_time
         """
         params = {
             "app_name": app_name,
             "user_id": user_id,
             "session_id": session_id,
-            "state_json": state_json,
-            "timestamp": current_timestamp
+            "state_json": state_json
+            # "timestamp": current_timestamp # No longer passing Python timestamp
         }
         result = self._execute_write(query, params)
         
         session_data = result[0] if result else {}
         
+        # Convert last_update_time from ms (Neo4j) to seconds (Python Session object)
+        db_last_update_time_ms = session_data.get("last_update_time")
+        python_last_update_time_s = db_last_update_time_ms / 1000.0 if db_last_update_time_ms is not None else time.time()
+
         return Session(
             app_name=session_data.get("app_name", app_name),
             user_id=session_data.get("user_id", user_id),
             id=session_data.get("id", session_id),
             state=initial_state, # Use the initial Python dict for the Session object
             events=[],
-            last_update_time=session_data.get("last_update_time", current_timestamp)
+            last_update_time=python_last_update_time_s
         )
 
     def get_session(self, *, app_name: str, user_id: str, session_id: str, config: dict = None) -> Session:
@@ -105,7 +117,8 @@ class Neo4jSessionService(BaseSessionService):
             id=s_node['id'],
             state=state,
             events=[],
-            last_update_time=s_node.get('last_update_time', __import__("time").time())
+            # Convert last_update_time from ms (Neo4j) to seconds (Python Session object)
+            last_update_time=s_node.get('last_update_time') / 1000.0 if s_node.get('last_update_time') is not None else __import__("time").time()
         )
         # Reconstruct Event objects for each event node
         for e_node in events_list:
@@ -201,63 +214,90 @@ class Neo4jSessionService(BaseSessionService):
                     session.state[key] = value
                     current_persisted_state_keys_values[key] = value
         
-        current_timestamp = event.timestamp if hasattr(event, "timestamp") and event.timestamp is not None else time.time()
-        session.last_update_time = current_timestamp
-        
+        # Ensure event has an ID and timestamp before preparing properties
+        # The event's timestamp is distinct from the session's last_update_time for optimistic locking
         if not getattr(event, "id", None):
             event.id = Event.new_id() if hasattr(Event, "new_id") else uuid.uuid4().hex
         if not getattr(event, "timestamp", None):
-            event.timestamp = current_timestamp
+            # Use current time if event doesn't have a timestamp; this is for the event node itself.
+            event.timestamp = time.time()
 
-        event_props_for_cypher = self._prepare_event_properties(event)
+        event_props_for_cypher = self._prepare_event_properties(event) # This uses event.timestamp (seconds)
         tool_calls_for_cypher = self._extract_tool_calls(event)
+
+        # Client's last known session update time in milliseconds for optimistic locking
+        # session.last_update_time is in seconds (float)
+        client_last_update_time_ms = int(session.last_update_time * 1000)
 
         query = """
         MATCH (s:Session {id: $session_id, app_name: $app_name, user_id: $user_id})
+        WHERE s.last_update_time = $client_last_update_time_ms
+        
+        // If match successful, update session timestamp immediately
+        SET s.last_update_time = timestamp(), // Neo4j's timestamp() is in ms
+            s.state_json = $new_session_state_json // Update state as well
+        
+        WITH s // Carry the successfully matched and updated session
         
         CREATE (e:Event)-[:OF_SESSION]->(s)
-        SET e = $event_props
+        SET e = $event_props // event_props contains 'timestamp' in seconds for the Event node
         
+        // Link to previous event if exists (NEXT relationship)
         WITH s, e
         OPTIONAL MATCH (prev_event:Event)-[:OF_SESSION]->(s)
-        WHERE prev_event.timestamp < e.timestamp AND prev_event <> e
+        WHERE prev_event.timestamp < e.timestamp AND prev_event <> e // Compare event timestamps (seconds)
         WITH s, e, prev_event ORDER BY prev_event.timestamp DESC LIMIT 1
         FOREACH (_ IN CASE WHEN prev_event IS NOT NULL THEN [1] ELSE [] END |
           CREATE (prev_event)-[:NEXT]->(e))
           
-        WITH s, e
+        // Create WROTE_STATE relationships for persisted state changes
+        WITH s, e // s is the session, e is the new event
         UNWIND keys($current_persisted_state_keys_values) AS k
           WITH s, e, k,
                $previous_values_for_delta[k] AS fromVal,
                $current_persisted_state_keys_values[k] AS toVal
+          // e.timestamp is from event_props, in seconds. Convert to ms if DB expects ms for WROTE_STATE.
+          // Assuming WROTE_STATE timestamp should align with event's timestamp.
+          // The schema description for WROTE_STATE has 'timestamp', not specifying unit.
+          // Let's assume e.timestamp (seconds) is fine, or convert if needed: e.g. e.timestamp * 1000
           CREATE (e)-[:WROTE_STATE {key: k, fromValue_json: CASE WHEN fromVal IS NOT NULL THEN apoc.convert.toJson(fromVal) ELSE null END, toValue_json: CASE WHEN toVal IS NOT NULL THEN apoc.convert.toJson(toVal) ELSE null END, timestamp: e.timestamp}]->(s)
 
-        WITH e
+        // Create INVOKED_TOOL relationships
+        WITH e, s // Pass s along if needed, though not directly used in UNWIND tool_calls
         UNWIND $tool_calls_data AS tc_data
           MERGE (t:ToolCall {id: tc_data.id})
           SET t += tc_data
           CREATE (e)-[:INVOKED_TOOL]->(t)
           
-        WITH s
-        SET s.state_json = $new_session_state_json,
-            s.last_update_time = $event_timestamp
-        
-        RETURN e.id AS event_id
+        // Return the event id and the new session update time (in ms from DB)
+        RETURN e.id AS event_id, s.last_update_time AS new_session_last_update_time_ms
         """
         
         params = {
             "session_id": session.id,
             "app_name": session.app_name,
             "user_id": session.user_id,
-            "event_props": event_props_for_cypher,
+            "client_last_update_time_ms": client_last_update_time_ms,
+            "new_session_state_json": json.dumps(session.state), # New state applied to session.state in Python
+            "event_props": event_props_for_cypher, # Contains event.id, event.timestamp (seconds), etc.
             "previous_values_for_delta": previous_values_for_delta,
             "current_persisted_state_keys_values": current_persisted_state_keys_values,
-            "tool_calls_data": tool_calls_for_cypher,
-            "new_session_state_json": json.dumps(session.state),
-            "event_timestamp": event_props_for_cypher["timestamp"]
+            "tool_calls_data": tool_calls_for_cypher
         }
 
-        self._execute_write(query, params)
+        result = self._execute_write(query, params)
+        
+        if not result or not result[0].get("new_session_last_update_time_ms"):
+            raise StaleSessionError(
+                f"Session {session.id} update failed due to stale data. "
+                f"Client timestamp: {client_last_update_time_ms}, current DB timestamp may differ."
+            )
+
+        new_db_timestamp_ms = result[0]["new_session_last_update_time_ms"]
+        session.last_update_time = new_db_timestamp_ms / 1000.0 # Update Python session with new time in seconds
+        
+        # event.timestamp was set at the beginning of the method if not present.
+        # session.last_update_time is now updated from DB.
         
         session.events.append(event)
         return event
@@ -309,13 +349,13 @@ class Neo4jSessionService(BaseSessionService):
             text_summary = str(event.content)
 
         return {
-            "id": event.id,
-            "author": event.author,
-            "timestamp": event.timestamp or time.time(), # Ensure timestamp exists
-            "invocation_id": getattr(event, "invocation_id", None) or "",
-            "content_json": content_json_str,
-            "actions_json": actions_json_str,
-            "text": text_summary # For full-text search on events if needed later
+            "id": event.id, # string
+            "author": event.author, # string
+            "timestamp": event.timestamp, # float seconds, ensured to exist
+            "invocation_id": getattr(event, "invocation_id", None) or "", # string
+            "content_json": content_json_str, # string | None
+            "actions_json": actions_json_str, # string | None
+            "text": text_summary # string
         }
 
     # ---------- deletion ----------
