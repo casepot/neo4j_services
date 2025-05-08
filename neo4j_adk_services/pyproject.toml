@@ -22,7 +22,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "neo4j>=5.0",
+    "neo4j>=5.28,<6",
     "google-adk", # Assuming google-adk is the core dependency
     "google-genai", # For types, if not bundled with adk
 ]
@@ -30,7 +30,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest",
-    # "testcontainers[neo4j]", # For integration tests
+    "testcontainers[neo4j]>=4.10,<5", # For integration tests
 ]
 # Example of how the original document suggested for ADK itself:
 # neo4j = ["neo4j>=5.0"] # This is now in main dependencies for this package

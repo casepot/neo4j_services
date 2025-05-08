@@ -2,7 +2,7 @@ import pytest
 import asyncio
 import time
 from neo4j import GraphDatabase, AsyncGraphDatabase, exceptions as neo4j_exceptions
-from testcontainers.neo4j import Neo4jContainer
+from testcontainers.neo4j import Neo4jContainer, Neo4jLabsPlugin
 
 # Helper function to wait for Neo4j to be ready
 def _wait_for_neo4j(uri: str, user="neo4j", password="test", retries=5, delay=5):
@@ -34,10 +34,13 @@ def neo4j_container_instance():
     # Neo4j 5.19 is specified in the issue.
     # Enable APOC plugin using the correct environment variable for Neo4j 5.x
     try:
-        with Neo4jContainer("neo4j:5.19.0") \
-                .with_env("NEO4J_AUTH", "neo4j/test") \
-                .with_env("NEO4J_PLUGINS", '["apoc"]') as neo_container: # Use with_env for plugins
-            print(f"Neo4j container started: {neo_container.get_container_id()}")
+        with Neo4jContainer("neo4j:5.26.6") \
+                .with_labs_plugins(Neo4jLabsPlugin.APOC) \
+                .with_env_variable("NEO4J_AUTH", "neo4j/test") as neo_container:
+            # v4+: use get_container_name() or omit
+            container_name = neo_container.get_container_name()
+            print(f"Neo4j test-container is up (name={container_name}) — Bolt: "
+                  f"{neo_container.get_connection_url()}")
             yield neo_container
     except Exception as e:
         print(f"Error starting Neo4j container: {e}")
