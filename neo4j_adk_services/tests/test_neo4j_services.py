@@ -63,6 +63,7 @@ except ImportError:
 # We need to import neo4j to patch its driver
 import neo4j
 from neo4j_adk_services.src.neo4j_session_service import Neo4jSessionService, StaleSessionError # Import StaleSessionError
+from neo4j_adk_services.src.neo4j_session_service import Neo4jSessionService, StaleSessionError # Import StaleSessionError
 from neo4j_adk_services.src.neo4j_memory_service import Neo4jMemoryService
 # Assuming SearchMemoryResponse and MemoryResult would be part of google.adk.memory
 try:
@@ -145,6 +146,7 @@ class TestNeo4jServices(unittest.TestCase):
         
         # Monkey-patch the DB execution methods for isolation for specific test logic
         self._db = {"sessions": {}, "events": {}, "next_rels": {}} # Stores session, event, and NEXT relationship data for mock
+        self._db = {"sessions": {}, "events": {}, "next_rels": {}} # Stores session, event, and NEXT relationship data for mock
         
         # Close the drivers created by the services to avoid resource warnings if tests run many times
         # In a real test with TestContainers, the container lifecycle would handle this.
@@ -191,18 +193,25 @@ class TestNeo4jServices(unittest.TestCase):
                     "id": sid,
                     "state_json": params["state_json"],
                     "last_update_time": int(time.time() * 1000) # Store as ms, like Neo4j timestamp()
+                    "last_update_time": int(time.time() * 1000) # Store as ms, like Neo4j timestamp()
                     # 'events' list will be implicitly associated by session_key in _db["events"]
                 }
                 # Return what the actual query returns
                 return [{
                     "app_name": app_name, "user_id": user_id, "id": sid,
                     "state_json": params["state_json"], "last_update_time": self._db["sessions"][sess_key]["last_update_time"]
+                    "state_json": params["state_json"], "last_update_time": self._db["sessions"][sess_key]["last_update_time"]
                 }]
 
             # Mock for append_event
             # MATCH (s:Session ...) WHERE s.last_update_time = $client_last_update_time_ms
             # SET s.last_update_time = timestamp(), s.state_json = $new_session_state_json
+            # MATCH (s:Session ...) WHERE s.last_update_time = $client_last_update_time_ms
+            # SET s.last_update_time = timestamp(), s.state_json = $new_session_state_json
             # CREATE (e:Event)-[:OF_SESSION]->(s) SET e = $event_props
+            # OPTIONAL MATCH (prev_event:Event)-[:OF_SESSION]->(s) ... CREATE (prev_event)-[:NEXT]->(e)
+            # RETURN e.id AS event_id, s.last_update_time AS new_session_last_update_time_ms
+            elif "WHERE s.last_update_time = $client_last_update_time_ms" in query and "CREATE (e:Event)-[:OF_SESSION]->(s)" in query:
             # OPTIONAL MATCH (prev_event:Event)-[:OF_SESSION]->(s) ... CREATE (prev_event)-[:NEXT]->(e)
             # RETURN e.id AS event_id, s.last_update_time AS new_session_last_update_time_ms
             elif "WHERE s.last_update_time = $client_last_update_time_ms" in query and "CREATE (e:Event)-[:OF_SESSION]->(s)" in query:
@@ -228,10 +237,33 @@ class TestNeo4jServices(unittest.TestCase):
                 self._db["sessions"][sess_key]["state_json"] = params["new_session_state_json"]
                 self._db["sessions"][sess_key]["last_update_time"] = new_db_timestamp_ms
 
+                sess_key = (app_name, user_id, sid)
+                
+                if sess_key not in self._db["sessions"]:
+                    return [] # Session not found, though query implies it should exist
+
+                # Optimistic locking check
+                client_ts_ms = params["client_last_update_time_ms"]
+                db_ts_ms = self._db["sessions"][sess_key]["last_update_time"]
+                if client_ts_ms != db_ts_ms:
+                    # This would cause the WHERE clause to fail in Neo4j, returning no rows.
+                    # The service should raise StaleSessionError.
+                    return []
+
+                # Update session state and timestamp
+                # Ensure new_db_timestamp_ms is greater than the current db_ts_ms
+                new_db_timestamp_ms = db_ts_ms + 100 # Increment by 100ms to ensure it's different
+                self._db["sessions"][sess_key]["state_json"] = params["new_session_state_json"]
+                self._db["sessions"][sess_key]["last_update_time"] = new_db_timestamp_ms
+
                 # Store event
                 event_props = params["event_props"]
                 eid = event_props["id"]
+                event_props = params["event_props"]
+                eid = event_props["id"]
                 self._db["events"][eid] = {
+                    "session_key": sess_key,
+                    **event_props # Store all properties from event_props (timestamp is in seconds here)
                     "session_key": sess_key,
                     **event_props # Store all properties from event_props (timestamp is in seconds here)
                 }
@@ -288,9 +320,12 @@ class TestNeo4jServices(unittest.TestCase):
                         collected_events_data.append(event_data_in_db)
                 
                 # Sort events by timestamp as the actual query does (event timestamps are in seconds)
+                # Sort events by timestamp as the actual query does (event timestamps are in seconds)
                 collected_events_data.sort(key=lambda e: e.get("timestamp", 0))
                 
                 # The actual query returns `s` (the session node) and `collect(e) AS events`
+                # `s_node` in get_session becomes `record['s']` (last_update_time is in ms)
+                # `events_list` becomes `record['events']` (event timestamps are in seconds)
                 # `s_node` in get_session becomes `record['s']` (last_update_time is in ms)
                 # `events_list` becomes `record['events']` (event timestamps are in seconds)
                 return [{"s": session_node_data, "events": collected_events_data}]
@@ -308,7 +343,36 @@ class TestNeo4jServices(unittest.TestCase):
                         # However, the service's list_sessions method creates Session objects where last_update_time is float seconds.
                         # So, the mock should return it in ms as it's stored in the DB.
                         result.append({"session_id": sid, "last_update": sess_data["last_update_time"]}) # ms
+                        # last_update_time in mock DB is ms, service expects it to be converted to Session obj (seconds)
+                        # but list_sessions directly uses the returned value.
+                        # For consistency, let's assume the mock returns it as the service would expect for Session obj construction.
+                        # However, the service's list_sessions method creates Session objects where last_update_time is float seconds.
+                        # So, the mock should return it in ms as it's stored in the DB.
+                        result.append({"session_id": sid, "last_update": sess_data["last_update_time"]}) # ms
                 return result
+            
+            # For NEXT relationship check in tests
+            # MATCH (a:Event {id:$e1})-[:NEXT]->()-[:NEXT]->(c:Event {id:$e3}) RETURN c
+            elif "MATCH (a:Event {id:$e1})-[:NEXT]->()-[:NEXT]->(c:Event {id:$e3}) RETURN c" in query:
+                e1_id = params.get("e1")
+                e3_id = params.get("e3")
+                # Check path: e1 -> e2 -> e3
+                # Find e2 such that (e1)-[:NEXT]->(e2)
+                e2_id = None
+                for (start_node, end_node) in self._db["next_rels"].keys():
+                    if start_node == e1_id:
+                        e2_id = end_node
+                        break
+                if not e2_id: return []
+
+                # Check if (e2)-[:NEXT]->(e3)
+                if self._db["next_rels"].get((e2_id, e3_id)):
+                    # Return the 'c' node (e3)
+                    if e3_id in self._db["events"]:
+                         # Simulate returning the node properties as Neo4j would
+                        return [{"c": self._db["events"][e3_id]}]
+                return []
+
             
             # For NEXT relationship check in tests
             # MATCH (a:Event {id:$e1})-[:NEXT]->()-[:NEXT]->(c:Event {id:$e3}) RETURN c
@@ -435,6 +499,9 @@ class TestNeo4jServices(unittest.TestCase):
         # last_update_time should be a float (seconds)
         self.assertIsInstance(sess.last_update_time, float)
 
+        # last_update_time should be a float (seconds)
+        self.assertIsInstance(sess.last_update_time, float)
+
         # Retrieving the session should return the same data
         fetched = self.session_service.get_session(app_name="test_app", user_id="user123", session_id=sess.id)
         self.assertIsNotNone(fetched)
@@ -444,9 +511,14 @@ class TestNeo4jServices(unittest.TestCase):
         self.assertIsInstance(fetched.last_update_time, float)
         self.assertAlmostEqual(fetched.last_update_time, sess.last_update_time, places=2)
 
+        self.assertIsInstance(fetched.last_update_time, float)
+        self.assertAlmostEqual(fetched.last_update_time, sess.last_update_time, places=2)
+
 
     def test_append_event_state_update(self):
         sess = self.session_service.create_session(app_name="test_app", user_id="user123", state={"count": 1})
+        original_last_update_time = sess.last_update_time
+
         original_last_update_time = sess.last_update_time
 
         # Create a dummy Event with state_delta action
@@ -472,6 +544,9 @@ class TestNeo4jServices(unittest.TestCase):
         self.assertIsNotNone(evt_stored_in_mock)
         self.assertEqual(evt_stored_in_mock["text"], "Hello world") # Check text field was generated
 
+        # Session last_update_time should be updated by append_event from the DB mock
+        self.assertNotAlmostEqual(sess.last_update_time, original_last_update_time, places=5)
+        self.assertTrue(sess.last_update_time > original_last_update_time)
         # Session last_update_time should be updated by append_event from the DB mock
         self.assertNotAlmostEqual(sess.last_update_time, original_last_update_time, places=5)
         self.assertTrue(sess.last_update_time > original_last_update_time)
