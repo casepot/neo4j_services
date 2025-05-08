@@ -32,11 +32,11 @@ def neo4j_container_instance():
     print("Starting Neo4j container for session...")
     # It's good practice to ensure the image is explicitly set if not default.
     # Neo4j 5.19 is specified in the issue.
-    # Ensure APOC plugin is available as per issue.
+    # Enable APOC plugin using the correct environment variable for Neo4j 5.x
     try:
         with Neo4jContainer("neo4j:5.19.0") \
                 .with_env("NEO4J_AUTH", "neo4j/test") \
-                .with_plugins(["apoc"]) as neo_container:
+                .with_env("NEO4J_PLUGINS", '["apoc"]') as neo_container: # Use with_env for plugins
             print(f"Neo4j container started: {neo_container.get_container_id()}")
             yield neo_container
     except Exception as e:
