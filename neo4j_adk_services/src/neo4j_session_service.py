@@ -208,16 +208,55 @@ class Neo4jSessionService(BaseSessionService):
                     for rec in records]
         return ListSessionsResponse(sessions=sessions)
 
-    def list_events(self, *, app_name: str, user_id: str, session_id: str) -> ListEventsResponse:
-        # Retrieve all events for a session (similar to get_session but only events)
+    def list_events(self, *, app_name: str, user_id: str, session_id: str, after: str = None, limit: int = 100) -> ListEventsResponse:
+        # Retrieve events for a session with pagination
+        # 'after' is expected to be the timestamp of the event to start after
+        # For simplicity, we'll use SKIP based on 'after' if it were an index,
+        # but true cursor-based pagination with timestamps requires a WHERE clause.
+        # Given the current structure, we'll use SKIP for offset and LIMIT for page size.
+        # A more robust 'after' would involve `WHERE e.timestamp > $after_timestamp`.
+        # For now, we'll interpret 'after' as an offset if it's an integer, or ignore if not easily translatable.
+        # The issue implies 'after' could be a token, which often maps to an event ID or timestamp.
+        # Let's assume 'after' is not directly used for SKIP in this simplified version,
+        # and focus on LIMIT. A full cursor implementation is more complex.
+        # The issue mentions "SKIP/LIMIT query", so we'll implement that.
+        # 'after' would typically be an event ID or a unique sort key value from the previous page.
+        # If 'after' is an event ID, the query would need to find that event's timestamp
+        # and then fetch events after it. This is complex for a simple SKIP/LIMIT.
+        # For this implementation, we will use limit and a conceptual skip (offset).
+        # The prompt's P9 description: "accept page_size, after token if desired".
+        # We will use 'limit' as page_size. 'after' token handling for SKIP is non-trivial
+        # without knowing the token's nature (e.g. if it's an offset or a value to compare).
+        # Let's assume 'after' is an offset for now, if provided as an int.
+        
+        skip_val = 0
+        if after is not None:
+            try:
+                # This is a simplification; a real 'after' token would not be a direct skip count.
+                # It would be an ID or a value from the last item of the previous page.
+                # For this exercise, we'll treat 'after' as a potential offset if it's an integer string.
+                skip_val = int(after)
+            except ValueError:
+                # If 'after' is not an integer, we ignore it for SKIP in this simplified model.
+                # A production system would need a more robust way to handle 'after' tokens.
+                pass
+
         query = (
             "MATCH (s:Session {app_name: $app_name, user_id: $user_id, id: $session_id})-[:HAS_EVENT]->(e:Event) "
-            "WITH e ORDER BY e.timestamp "
+            "WITH e ORDER BY e.timestamp " # Order before skip/limit
+            "SKIP $skip_count LIMIT $limit_count "
             "RETURN collect(e) AS events"
         )
-        result = self._execute_read(query, {"app_name": app_name, "user_id": user_id, "session_id": session_id})
-        events_list = [] # Renamed from events to avoid confusion with the ADK Event type
-        if result:
+        params = {
+            "app_name": app_name,
+            "user_id": user_id,
+            "session_id": session_id,
+            "skip_count": skip_val,
+            "limit_count": limit
+        }
+        result = self._execute_read(query, params)
+        events_list = []
+        if result and result[0]['events']: # Check if 'events' key exists and is not empty
             events_nodes = result[0]['events']
             import json
             for e_node in events_nodes:
@@ -233,13 +272,11 @@ class Neo4jSessionService(BaseSessionService):
                 if props.get('actions_json'):
                     try:
                         actions_data = json.loads(props['actions_json'])
-                        # Check if actions_data is not None before validation/instantiation
                         if actions_data is not None:
                             actions_obj = EventActions.model_validate(actions_data) if hasattr(EventActions, 'model_validate') else EventActions(**actions_data)
-                        # If actions_data is None after loading, actions_obj remains None
                     except (json.JSONDecodeError, TypeError):
                         actions_obj = None
-                event_obj = Event( # Renamed from event to event_obj
+                event_obj = Event(
                     id=props.get('id'),
                     author=props.get('author'),
                     timestamp=props.get('timestamp'),

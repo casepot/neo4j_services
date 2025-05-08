@@ -162,6 +162,18 @@ Both services require Neo4j connection details:
 *   `vector_dimension`: (int, optional) The dimensionality of the vectors produced by `embedding_function`. Required if `embedding_function` is provided.
 *   `similarity_top_k`: (int, optional, default: 5) The number of top similar results to retrieve in vector searches.
 *   `vector_distance_threshold`: (float, optional) A threshold for vector similarity scores (e.g., cosine similarity). Results below this threshold might be filtered out.
+*   `max_concurrent_requests`: (int, optional, default: 10) Maximum concurrent requests to the database, managed by an internal semaphore.
+
+### Async Upgrade Notice (Neo4jMemoryService)
+**Breaking Change**: The `Neo4jMemoryService` has been updated to use an asynchronous Neo4j driver for improved performance.
+*   `add_session_to_memory` is now an `async def` method.
+*   `search_memory` is now an `async def` method.
+*   A synchronous wrapper `search_memory_sync` is provided for convenience during transition:
+    ```python
+    # If you need to call search_memory from synchronous code:
+    results = memory_service.search_memory_sync(app_name="app", user_id="user", query="search term")
+    ```
+    For new asynchronous code, use `await memory_service.search_memory(...)`.
 
 ## Usage
 
@@ -292,32 +304,27 @@ memory_service.close()
 ## Running Tests
 
 1.  **Prerequisites**:
-    *   Docker installed and running.
-    *   The `neo4j_adk_services` package and its `dev` dependencies installed (e.g., `uv pip install -e ".[dev]"`).
+    *   Docker installed and running (for integration tests).
+    *   The `neo4j_adk_services` package and its `dev` dependencies installed (e.g., `uv pip install -e "./neo4j_adk_services[dev]"`). This will include `pytest`, `pytest-asyncio`, and `testcontainers`.
 
-2.  **Start Neo4j Container**:
-    A Neo4j instance must be running and accessible. The tests are configured to connect to `bolt://localhost:7687` with credentials `neo4j/test`. You can start a suitable container with:
-    ```bash
-    docker run -d --name neo4j-adk-test \
-      --publish=7474:7474 --publish=7687:7687 \
-      --env NEO4J_AUTH=neo4j/test \
-      --env 'NEO4J_PLUGINS=["apoc"]' \
-      neo4j:5 # Or a specific 5.x version like 2025.04.0 used in prompts
-    ```
-    Allow a few seconds for the container to initialize fully before running tests.
+2.  **Execute Tests**:
+    The integration tests now use `Testcontainers` to automatically spin up a Neo4j 5.19 Docker container with the APOC plugin. There is no need to manually start a Neo4j container for running the tests.
 
-3.  **Execute Tests**:
     Navigate to the root of the workspace (`/home/case/neo4j_services`) and run:
     ```bash
-    uv run python3 -m unittest discover -s neo4j_adk_services/tests -t .
+    pytest neo4j_adk_services/tests
     ```
-    Or, if not using `uv run` and your virtual environment is activated:
+    Or, using `uv`:
     ```bash
-    python3 -m unittest discover -s neo4j_adk_services/tests -t .
+    uv run pytest neo4j_adk_services/tests
     ```
+    The tests will:
+    *   Start a Neo4j container.
+    *   Run all unit and integration tests, including those for asynchronous methods and vector search capabilities against the live container.
+    *   Automatically stop the Neo4j container after tests complete.
 
 ## Troubleshooting
-*   **`TypeError: Can't instantiate abstract class Neo4jSessionService without an implementation for abstract method ...`**: Ensure all abstract methods from `BaseSessionService` are implemented in `Neo4jSessionService` with matching signatures (including keyword-only arguments where appropriate).
+*   **`TypeError: Can't instantiate abstract class Neo4jSessionService without an implementation for abstract method ...`**: Ensure all abstract methods from `BaseSessionService` (and `BaseMemoryService` for `Neo4jMemoryService`) are implemented with matching signatures.
 *   **`neo4j.exceptions.ServiceUnavailable: Couldn't connect to localhost:7687... Connection refused`**:
     *   Verify the Neo4j Docker container is running (`docker ps`).
     *   Ensure the port `7687` is correctly published.
