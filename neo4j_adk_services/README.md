@@ -43,7 +43,7 @@ The services are designed to create a rich, interconnected graph in Neo4j, rathe
 *   **Ephemeral State Handling**: Keys prefixed with `"temp:"` in `state_delta` are not persisted, aligning with ADK conventions.
 
 ### Neo4jMemoryService
-*   **Memory Ingestion**: Stores relevant information from session events as distinct `MemoryChunk` nodes. Each `MemoryChunk` typically contains the text content, author, timestamp, and the ID of the original event (`eid`). It also stores `app_name` and `user_id` for partitioned search.
+*   **Memory Ingestion**: Stores relevant information from session events as distinct `MemoryChunk` nodes. Each `MemoryChunk` typically contains the text content, author, timestamp, the ID of the original event (`eid`), and the `session_id` it belongs to. It also stores `app_name` and `user_id` for partitioned search.
 *   **Full-Text Search**: Implements keyword-based search over the `text` property of `MemoryChunk` nodes using Neo4j's full-text indexing.
 *   **Vector Search (Semantic Similarity)**:
     *   Supports storing embedding vectors (e.g., from OpenAI, Gemini) on `MemoryChunk` nodes.
@@ -86,6 +86,7 @@ The services are designed to create a rich, interconnected graph in Neo4j, rathe
     *   `ts`: (float, timestamp of the original event)
     *   `app_name`: (string, for partitioning)
     *   `user_id`: (string, for partitioning)
+    *   `session_id`: (string, ID of the session this chunk belongs to)
     *   `embedding`: (list of floats, optional vector embedding)
 *   **`Metric`** (Optional):
     *   `id`: (string, unique metric identifier)
@@ -95,11 +96,11 @@ The services are designed to create a rich, interconnected graph in Neo4j, rathe
     *   `ts`: (float, timestamp)
 
 ### Constraints and Indexes
-The services attempt to create the following constraints and indexes upon initialization if they don't already exist. Ensure the Neo4j user has permissions to create them.
+The services attempt to create the following constraints and indexes upon initialization if they don't already exist. These operations are designed to be idempotent (e.g., using `IF NOT EXISTS` or by handling `ClientError` exceptions for procedure-based index creation), making service restarts against an existing database safer. Ensure the Neo4j user has permissions to create them.
 
 *   **Constraints**:
-    *   `CREATE CONSTRAINT IF NOT EXISTS ON (s:Session) ASSERT (s.app_name, s.user_id, s.id) IS UNIQUE` (Handled by `Neo4jSessionService`)
-    *   `CREATE CONSTRAINT IF NOT EXISTS FOR (t:ToolCall) REQUIRE t.id IS UNIQUE` (Handled by `Neo4jSessionService`)
+    *   `CREATE CONSTRAINT session_unique IF NOT EXISTS FOR (s:Session) REQUIRE (s.app_name, s.user_id, s.id) IS UNIQUE;` (Handled by `Neo4jSessionService`)
+    *   `CREATE CONSTRAINT tool_call_id_unique IF NOT EXISTS FOR (t:ToolCall) REQUIRE t.id IS UNIQUE;` (Handled by `Neo4jSessionService`, assuming a name like `tool_call_id_unique` for consistency, though the service code uses the unnamed `IF NOT EXISTS FOR...REQUIRE` syntax which is also valid)
     *   (Conceptual, if `Metric` nodes are used) `CREATE CONSTRAINT metric_id IF NOT EXISTS FOR (m:Metric) REQUIRE m.id IS UNIQUE;`
 *   **Full-Text Index** (for `Neo4jMemoryService`):
     *   `CALL db.index.fulltext.createNodeIndex('MemoryTextIndex', ['MemoryChunk'], ['text'])` (Handled by `Neo4jMemoryService`)
@@ -193,7 +194,8 @@ user_sessions = session_service.list_sessions(
     app_name="my_adk_app",
     user_id="user123"
 )
-print(f"User user123 has {len(user_sessions)} sessions.")
+# list_sessions returns a ListSessionsResponse object
+print(f"User user123 has {len(user_sessions.sessions)} sessions.")
 
 # ... (other operations like list_events, delete_session)
 
@@ -250,18 +252,16 @@ memory_results = memory_service.search_memory(
     query=search_query
 )
 
-# The mock returns a dict: {"memories": [...]}
-# The actual service with ADK types would return SearchMemoryResponse
-if isinstance(memory_results, dict) and "memories" in memory_results:
-    for mem_item in memory_results["memories"]:
-        print(f"  Session ID: {mem_item.get('session_id')}")
-        for snippet in mem_item.get("snippets", []):
-            print(f"    Snippet: {snippet}")
-elif hasattr(memory_results, "memories"): # If it's a SearchMemoryResponse object
-     for mem_item in memory_results.memories:
-        print(f"  Session ID: {mem_item.session_id}") # Accessing attributes
-        for snippet in mem_item.snippets:
-            print(f"    Snippet: {snippet}")
+# The service returns a SearchMemoryResponse object
+if hasattr(memory_results, "memories"): # memory_results is a SearchMemoryResponse object
+     for mem_item in memory_results.memories: # mem_item is a MemoryResult object
+        print(f"  Session ID: {mem_item.session_id}")
+        # MemoryResult contains a list of Event objects
+        for event_detail in mem_item.events:
+            event_text = ""
+            if event_detail.content and hasattr(event_detail.content, 'parts'):
+                event_text = " ".join([part.text for part in event_detail.content.parts if hasattr(part, 'text')])
+            print(f"    Event ({event_detail.id} by {event_detail.author}): {event_text}")
 
 
 # Close the driver

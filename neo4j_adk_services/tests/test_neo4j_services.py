@@ -64,13 +64,37 @@ except ImportError:
 import neo4j
 from neo4j_adk_services.src.neo4j_session_service import Neo4jSessionService
 from neo4j_adk_services.src.neo4j_memory_service import Neo4jMemoryService
-# Assuming SearchMemoryResponse would be part of google.adk.memory
+# Assuming SearchMemoryResponse and MemoryResult would be part of google.adk.memory
 try:
-    from google.adk.memory import SearchMemoryResponse
+    from google.adk.memory.base_memory_service import SearchMemoryResponse, MemoryResult
+    from google.adk.events import Event # For dummy MemoryResult
+    from google.genai.types import Content, Part # For dummy Event in MemoryResult
 except ImportError:
+    # This block is for when ADK types are not available.
+    # The Event, Content, Part classes might already be defined above if ADK is missing.
+    # Ensure they are available for the dummy MemoryResult.
+    if 'Event' not in globals():
+        class Event:
+            def __init__(self, id, author, timestamp, content, **kwargs):
+                self.id = id
+                self.author = author
+                self.timestamp = timestamp
+                self.content = content
+    if 'Content' not in globals():
+        class Content:
+            def __init__(self, parts=None): self.parts = parts or []
+    if 'Part' not in globals():
+        class Part:
+            def __init__(self, text=""): self.text = text
+
+    class MemoryResult: # Dummy for tests if not found
+        def __init__(self, session_id: str, events: list[Event]): # Changed snippets to events
+            self.session_id = session_id
+            self.events = events # Changed snippets to events
+
     class SearchMemoryResponse: # Dummy for tests if not found
-        def __init__(self, results=None):
-            self.results = results or []
+        def __init__(self, memories=None):
+            self.memories = memories or []
 
 
 class TestNeo4jServices(unittest.TestCase):
@@ -148,9 +172,10 @@ class TestNeo4jServices(unittest.TestCase):
             if params is None: params = {}
 
             # Mock for __init__ constraint creation
-            if "CREATE CONSTRAINT IF NOT EXISTS FOR (t:ToolCall) REQUIRE t.id IS UNIQUE" in query:
+            if "CREATE CONSTRAINT IF NOT EXISTS FOR (t:ToolCall) REQUIRE t.id IS UNIQUE" in query: # ToolCall constraint
                 return []
-            if "CREATE CONSTRAINT IF NOT EXISTS ON (s:Session) ASSERT (s.app_name, s.user_id, s.id) IS UNIQUE" in query:
+            # Updated Session constraint check
+            if "CREATE CONSTRAINT session_unique IF NOT EXISTS FOR (s:Session) REQUIRE (s.app_name, s.user_id, s.id) IS UNIQUE" in query:
                 return []
 
             # Mock for create_session
@@ -291,6 +316,7 @@ class TestNeo4jServices(unittest.TestCase):
                         "ts": chunk_data["ts"],
                         "app_name": params.get("app"), # app_name from parameters
                         "user_id": params.get("user"), # user_id from parameters
+                        "session_id": params.get("sid"), # session_id from parameters
                         "embedding": chunk_data.get("embedding")
                     }
                     added_count += 1
@@ -313,19 +339,10 @@ class TestNeo4jServices(unittest.TestCase):
                     app_match = chunk_data.get("app_name") == app_name_param
                     user_match = chunk_data.get("user_id") == user_id_param
                     if text_match and app_match and user_match:
-                        # The test expects session_id. We need to retrieve this.
-                        # This requires linking MemoryChunk back to a Session or storing session_id on MemoryChunk.
-                        # The current MemoryChunk mock stores eid. We need to find the session via eid.
-                        original_session_id = None
-                        for _eid_event, event_detail in self._db.get("events", {}).items():
-                            if _eid_event == chunk_data.get("eid"):
-                                original_session_id = event_detail.get("session_key")[2] # (app, user, sid)
-                                break
-                        
+                        # session_id is now expected to be directly on the chunk_data from the mock DB
                         mock_results.append({
-                            # "session_id": chunk_data.get("session_id"), # If MemoryChunk stored session_id
-                            "session_id": original_session_id, # Derived for the test
-                            "event_id": chunk_data.get("eid"), # Keep event_id as per query
+                            "session_id": chunk_data.get("session_id"), # Use directly stored session_id
+                            "event_id": chunk_data.get("eid"),
                             "text": chunk_data.get("text"),
                             "author": chunk_data.get("author"),
                             "ts": chunk_data.get("ts"),
@@ -441,53 +458,44 @@ class TestNeo4jServices(unittest.TestCase):
         # Search for a keyword present in evt1 content
         response = self.memory_service.search_memory(app_name="test_app", user_id="user123", query="capital of France")
         
-        # Verify the memory search response contains the expected snippet
-        # Verify the memory search response contains the expected snippet
-        # SearchMemoryResponse uses 'memories' attribute
-        if isinstance(response, SearchMemoryResponse):
-            self.assertTrue(hasattr(response, 'memories'), "Response object should have a 'memories' attribute")
-            memories_list = response.memories
-        elif isinstance(response, dict): # Fallback case in the service
-            self.assertIn('memories', response, "Response dict should have a 'memories' key")
-            memories_list = response['memories']
-        else:
-            self.fail(f"Unexpected response type: {type(response)}")
-
-        self.assertGreaterEqual(len(memories_list), 1, "Should find at least one matching session")
+        self.assertIsInstance(response, SearchMemoryResponse, "Search memory should return a SearchMemoryResponse object.")
         
-        found_snippet = False
-        for mem_item_data in memories_list: # mem_item_data is expected to be a dict like {"session_id": ..., "snippets": ...}
-            # The MemoryResult objects themselves might be dicts or objects depending on ADK version/Pydantic
-            # For this test, the service mock returns dicts for snippets.
-            current_session_id = None
-            current_snippets = []
-            if isinstance(mem_item_data, dict):
-                current_session_id = mem_item_data.get("session_id")
-                current_snippets = mem_item_data.get("snippets", [])
-            # If MemoryResult is an object, adjust access accordingly, e.g. mem_item_data.session_id
-            # else:
-            #     current_session_id = getattr(mem_item_data, "session_id", None)
-            #     current_snippets = getattr(mem_item_data, "snippets", [])
+        memories_list = response.memories
+        self.assertIsNotNone(memories_list, "Response memories list should not be None.")
 
-
-            if current_session_id == sess.id:
-                for snippet in current_snippets:
-                    if "Paris is the capital of France." in snippet:
-                        found_snippet = True
+        # Check if any MemoryResult was found. The mock might return an empty list if no match.
+        # If a match is expected, assertGreaterEqual(len(memories_list), 1)
+        # For this specific query "capital of France", we expect a match.
+        self.assertGreaterEqual(len(memories_list), 1, "Should find at least one matching MemoryResult.")
+        
+        found_event_text = False
+        for mem_item in memories_list: # mem_item is now expected to be a MemoryResult object
+            self.assertIsInstance(mem_item, MemoryResult, "Each item in memories should be a MemoryResult object.")
+            if mem_item.session_id == sess.id:
+                self.assertTrue(hasattr(mem_item, 'events'), "MemoryResult should have an 'events' attribute.")
+                for event_in_memory in mem_item.events:
+                    self.assertIsInstance(event_in_memory, Event, "Each event in MemoryResult should be an Event object.")
+                    # Assuming the reconstructed event has content with parts
+                    if event_in_memory.content and hasattr(event_in_memory.content, 'parts'):
+                        for part in event_in_memory.content.parts:
+                            if hasattr(part, 'text') and "Paris is the capital of France." in part.text:
+                                found_event_text = True
+                                break
+                    if found_event_text:
                         break
-            if found_snippet:
+            if found_event_text:
                 break
         
-        self.assertTrue(found_snippet, "Memory search should retrieve the expected snippet from session memory")
+        self.assertTrue(found_event_text, "Memory search should retrieve an event with the expected text.")
 
     def test_list_sessions(self):
         self.session_service.create_session(app_name="app1", user_id="user1", state={"data": "session1"})
         self.session_service.create_session(app_name="app1", user_id="user1", state={"data": "session2"})
         self.session_service.create_session(app_name="app1", user_id="user2", state={"data": "session3"}) # Different user
 
-        listed_sessions = self.session_service.list_sessions(app_name="app1", user_id="user1")
-        self.assertEqual(len(listed_sessions), 2)
-        for s in listed_sessions:
+        listed_sessions_response = self.session_service.list_sessions(app_name="app1", user_id="user1")
+        self.assertEqual(len(listed_sessions_response.sessions), 2)
+        for s in listed_sessions_response.sessions:
             self.assertEqual(s.app_name, "app1")
             self.assertEqual(s.user_id, "user1")
 

@@ -1,5 +1,6 @@
 from neo4j import GraphDatabase, Record # Added Record
 from google.adk.sessions import BaseSessionService, Session
+from google.adk.sessions.base_session_service import ListSessionsResponse, ListEventsResponse
 from google.adk.events import Event, EventActions # Assuming EventActions might contain tool_calls
 from google.genai import types  # for Content, Part
 import json # For _extract_tool_calls and _encode_event
@@ -16,8 +17,9 @@ class Neo4jSessionService(BaseSessionService):
         with self._driver.session(database=self._database) as db_session:
             # Session constraint (original)
             db_session.run(
-                "CREATE CONSTRAINT IF NOT EXISTS ON (s:Session) "
-                "ASSERT (s.app_name, s.user_id, s.id) IS UNIQUE"
+                "CREATE CONSTRAINT session_unique IF NOT EXISTS "
+                "FOR (s:Session) "
+                "REQUIRE (s.app_name, s.user_id, s.id) IS UNIQUE"
             )
             # ToolCall constraint (from patch)
             db_session.run(
@@ -129,7 +131,7 @@ class Neo4jSessionService(BaseSessionService):
             sess.events.append(event)
         return sess
 
-    def list_sessions(self, *, app_name: str, user_id: str) -> list[Session]: # Added return type hint
+    def list_sessions(self, *, app_name: str, user_id: str) -> ListSessionsResponse:
         # Query all sessions for the user (return basic info)
         query = (
             "MATCH (s:Session {app_name: $app_name, user_id: $user_id}) "
@@ -140,10 +142,9 @@ class Neo4jSessionService(BaseSessionService):
         sessions = [Session(app_name=app_name, user_id=user_id, id=rec["session_id"],
                              state={}, events=[], last_update_time=rec.get("last_update", 0))
                     for rec in records]
-        # Ideally use ListSessionsResponse(pydantic model) if available
-        return sessions
+        return ListSessionsResponse(sessions=sessions)
 
-    def list_events(self, *, app_name: str, user_id: str, session_id: str) -> list[Event]: # Added return type hint
+    def list_events(self, *, app_name: str, user_id: str, session_id: str) -> ListEventsResponse:
         # Retrieve all events for a session (similar to get_session but only events)
         query = (
             "MATCH (s:Session {app_name: $app_name, user_id: $user_id, id: $session_id})-[:HAS_EVENT]->(e:Event) "
@@ -151,7 +152,7 @@ class Neo4jSessionService(BaseSessionService):
             "RETURN collect(e) AS events"
         )
         result = self._execute_read(query, {"app_name": app_name, "user_id": user_id, "session_id": session_id})
-        events = []
+        events_list = [] # Renamed from events to avoid confusion with the ADK Event type
         if result:
             events_nodes = result[0]['events']
             import json
@@ -165,7 +166,7 @@ class Neo4jSessionService(BaseSessionService):
                 if props.get('actions_json'):
                     actions_data = json.loads(props['actions_json'])
                     actions_obj = EventActions.model_validate(actions_data) if hasattr(EventActions, 'model_validate') else EventActions(**actions_data)
-                event = Event(
+                event_obj = Event( # Renamed from event to event_obj
                     id=props.get('id'),
                     author=props.get('author'),
                     timestamp=props.get('timestamp'),
@@ -173,8 +174,8 @@ class Neo4jSessionService(BaseSessionService):
                     content=content_obj,
                     actions=actions_obj
                 )
-                events.append(event)
-        return events
+                events_list.append(event_obj)
+        return ListEventsResponse(events=events_list)
 
     def append_event(self, session: Session, event: Event) -> Event:
         """Append an event to the session, update state, and persist to Neo4j with enhanced graph structure."""
