@@ -26,19 +26,23 @@ The services are designed to create a rich, interconnected graph in Neo4j, rathe
     *   `ToolCall`: Represents an invocation of an external tool/function during an event, persisted as a distinct node in Neo4j for analysis. Data is extracted from `google.genai.types.FunctionCall` objects found in the event content.
     *   `MemoryChunk`: Represents a piece of information (derived from an event) stored for long-term memory.
     *   `Metric` (Optional): Represents a performance or usage metric associated with an event.
+    *   `AppState`: (P7) Represents global state for an application, shared across all users and sessions of that app. Identified by `app_name`.
+    *   `UserState`: (P7) Represents global state for a specific user within an application, shared across all sessions of that user for that app. Identified by `app_name` and `user_id`.
 *   **Relationships:**
     *   `(:User)-[:STARTED_SESSION]->(:Session)`: Links a user to the sessions they initiated.
     *   `(:Event)-[:OF_SESSION]->(:Session)`: Links an event to its parent session.
     *   `(:Event)-[:NEXT]->(:Event)`: Creates a chronological chain of events within a session for efficient timeline traversal.
-    *   `(:Event)-[:WROTE_STATE {key, fromValue_json, toValue_json, timestamp}]->(:Session)`: Records changes to the session state, linking the event that caused the change to the session. It stores the key, previous value (as JSON), new value (as JSON), and timestamp of the change.
+    *   `(:Event)-[:WROTE_STATE {key, fromValue_json, toValue_json, timestamp}]->(:Session)`: Records changes to session-specific state (keys not prefixed with `app:` or `user:`), linking the event that caused the change to the session. It stores the key, previous value (as JSON), new value (as JSON), and timestamp of the change.
     *   `(:Event)-[:INVOKED_TOOL]->(:ToolCall)`: Links an event (specifically, the one containing the `FunctionCall` in its content) to the corresponding `:ToolCall` node representing that invocation.
     *   `(:Metric)-[:FOR_EVENT]->(:Event)` (Optional): Links a metric to the event it pertains to.
     *   `(:MemoryChunk)-[:SIMILAR {score}]->(:MemoryChunk)` (Conceptual): Represents semantic similarity between memory chunks. This relationship is intended to be populated offline, for example, using Neo4j Graph Data Science (GDS) k-NN algorithms.
 
 ### Neo4jSessionService
-*   **Session Management**: Creates and retrieves sessions, linking them to `App` and `User` nodes.
+*   **Session Management**: Creates and retrieves sessions, linking them to `App` and `User` nodes. When a session is created, it merges in the latest state from corresponding `AppState` and `UserState` shadow nodes.
 *   **Event Persistence**: Appends events to sessions, automatically creating `NEXT` relationships to maintain order.
-*   **State Change Tracking**: For every persisted key in `event.actions.state_delta`, a `WROTE_STATE` relationship is created from the `Event` to the `Session`, capturing the key, old value (if available and simple), new value, and timestamp.
+*   **State Change Tracking**:
+    *   For session-specific keys (not prefixed with `app:` or `user:`) in `event.actions.state_delta`, a `WROTE_STATE` relationship is created from the `Event` to the `Session`, capturing the key, old value, new value, and timestamp.
+    *   **Shadow State Updates (P7)**: For keys prefixed with `app:` or `user:` in `event.actions.state_delta`, the service updates corresponding `AppState` or `UserState` nodes. These shadow nodes store their state as a JSON string and have a `version` timestamp. Updates use `apoc.map.merge` for handling concurrent writes (last writer wins for a given key within the shadow node).
 *   **Tool Call Tracking**: If an event's content contains `google.genai.types.FunctionCall` objects (retrieved via `event.get_function_calls()`), corresponding `:ToolCall` nodes are created in Neo4j with relevant details (name, arguments as JSON). These nodes are linked from the event via `INVOKED_TOOL` relationships.
 *   **Ephemeral State Handling**: Keys prefixed with `"temp:"` in `state_delta` are not persisted, aligning with ADK conventions.
 *   **Optimistic Locking**: When appending events, the service checks `Session.last_update_time` (converted to milliseconds) against the database version to prevent stale writes. If a mismatch occurs, a `StaleSessionError` is raised.
@@ -95,13 +99,24 @@ The services are designed to create a rich, interconnected graph in Neo4j, rathe
     *   `value`: (float)
     *   `unit`: (string, optional, e.g., "ms", "tokens")
     *   `ts`: (float, timestamp)
+*   **`AppState`** (P7):
+    *   `app_name`: (string, unique identifier for the application, e.g., "my_adk_app")
+    *   `state_json`: (string, JSON representation of app-specific global state)
+    *   `version`: (integer, millisecond Unix epoch timestamp, updated on modification)
+*   **`UserState`** (P7):
+    *   `app_name`: (string, application identifier)
+    *   `user_id`: (string, user identifier)
+    *   `state_json`: (string, JSON representation of user-specific global state for that app)
+    *   `version`: (integer, millisecond Unix epoch timestamp, updated on modification)
 
 ### Constraints and Indexes
 The services attempt to create the following constraints and indexes upon initialization if they don't already exist. These operations are designed to be idempotent (e.g., using `IF NOT EXISTS` or by handling `ClientError` exceptions for procedure-based index creation), making service restarts against an existing database safer. Ensure the Neo4j user has permissions to create them.
 
 *   **Constraints**:
     *   `CREATE CONSTRAINT session_unique IF NOT EXISTS FOR (s:Session) REQUIRE (s.app_name, s.user_id, s.id) IS UNIQUE;` (Handled by `Neo4jSessionService`)
-    *   `CREATE CONSTRAINT tool_call_id_unique IF NOT EXISTS FOR (t:ToolCall) REQUIRE t.id IS UNIQUE;` (Handled by `Neo4jSessionService`, assuming a name like `tool_call_id_unique` for consistency, though the service code uses the unnamed `IF NOT EXISTS FOR...REQUIRE` syntax which is also valid)
+    *   `CREATE CONSTRAINT tool_call_id_unique IF NOT EXISTS FOR (t:ToolCall) REQUIRE t.id IS UNIQUE;` (Handled by `Neo4jSessionService`)
+    *   `CREATE CONSTRAINT app_state_unique IF NOT EXISTS FOR (a:AppState) REQUIRE a.app_name IS UNIQUE;` (P7, Handled by `Neo4jSessionService`)
+    *   `CREATE CONSTRAINT user_state_unique IF NOT EXISTS FOR (u:UserState) REQUIRE (u.app_name, u.user_id) IS UNIQUE;` (P7, Handled by `Neo4jSessionService`)
     *   (Conceptual, if `Metric` nodes are used) `CREATE CONSTRAINT metric_id IF NOT EXISTS FOR (m:Metric) REQUIRE m.id IS UNIQUE;`
 *   **Full-Text Index** (for `Neo4jMemoryService`):
     *   `CALL db.index.fulltext.createNodeIndex('MemoryTextIndex', ['MemoryChunk'], ['text'])` (Handled by `Neo4jMemoryService`)

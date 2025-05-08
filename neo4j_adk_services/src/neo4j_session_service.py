@@ -32,6 +32,16 @@ class Neo4jSessionService(BaseSessionService):
             db_session.run(
                 "CREATE CONSTRAINT IF NOT EXISTS FOR (t:ToolCall) REQUIRE t.id IS UNIQUE"
             )
+            # AppState constraint (P7)
+            db_session.run(
+                "CREATE CONSTRAINT app_state_unique IF NOT EXISTS "
+                "FOR (a:AppState) REQUIRE a.app_name IS UNIQUE"
+            )
+            # UserState constraint (P7)
+            db_session.run(
+                "CREATE CONSTRAINT user_state_unique IF NOT EXISTS "
+                "FOR (u:UserState) REQUIRE (u.app_name, u.user_id) IS UNIQUE"
+            )
         # BaseSessionService has no specific __init__, but call super if needed
         super().__init__()
 
@@ -49,8 +59,40 @@ class Neo4jSessionService(BaseSessionService):
         if session_id is None:
             session_id = Session.new_id() if hasattr(Session, "new_id") else uuid.uuid4().hex
         
-        initial_state = state or {}
-        state_json = json.dumps(initial_state)
+        initial_session_state = state or {}
+
+        # P7: Fetch and merge shadow AppState and UserState
+        shadow_app_state_query = """
+        OPTIONAL MATCH (as:AppState {app_name: $app_name})
+        RETURN as.state_json AS app_state_json, as.version AS app_state_version
+        """
+        app_state_result = self._execute_read(shadow_app_state_query, {"app_name": app_name})
+        
+        shadow_user_state_query = """
+        OPTIONAL MATCH (us:UserState {app_name: $app_name, user_id: $user_id})
+        RETURN us.state_json AS user_state_json, us.version AS user_state_version
+        """
+        user_state_result = self._execute_read(shadow_user_state_query, {"app_name": app_name, "user_id": user_id})
+
+        merged_state = initial_session_state.copy()
+
+        if app_state_result and app_state_result[0].get("app_state_json"):
+            app_shadow_data = json.loads(app_state_result[0]["app_state_json"])
+            # Simple merge: shadow state overlays initial session state for app-specific keys
+            # More sophisticated versioning/merging could be added if needed.
+            # For now, assume shadow state is more current for its keys.
+            for k, v in app_shadow_data.items():
+                if k.startswith("app:"): # Only merge app-prefixed keys from AppState
+                    merged_state[k] = v
+        
+        if user_state_result and user_state_result[0].get("user_state_json"):
+            user_shadow_data = json.loads(user_state_result[0]["user_state_json"])
+            # Simple merge for user-specific keys
+            for k, v in user_shadow_data.items():
+                if k.startswith("user:"): # Only merge user-prefixed keys from UserState
+                     merged_state[k] = v
+        
+        state_json = json.dumps(merged_state)
         # current_timestamp = time.time() # Will use Neo4j's timestamp()
 
         # Cypher query adapted from patch, creating App, User, and Session with relationship
@@ -88,7 +130,7 @@ class Neo4jSessionService(BaseSessionService):
             app_name=session_data.get("app_name", app_name),
             user_id=session_data.get("user_id", user_id),
             id=session_data.get("id", session_id),
-            state=initial_state, # Use the initial Python dict for the Session object
+            state=merged_state, # Use the merged state for the Session object
             events=[],
             last_update_time=python_last_update_time_s
         )
@@ -220,11 +262,23 @@ class Neo4jSessionService(BaseSessionService):
                     previous_values_for_delta[key] = session.state.get(key)
 
         current_persisted_state_keys_values = {}
+        app_state_delta = {}
+        user_state_delta = {}
+
         if event.actions and hasattr(event.actions, "state_delta"):
             state_delta_from_event = event.actions.state_delta or {}
             for key, value in state_delta_from_event.items():
                 if key.startswith("temp:"):
                     continue
+                
+                # Populate app_state_delta and user_state_delta (P7)
+                if key.startswith("app:"):
+                    app_state_delta[key] = value
+                elif key.startswith("user:"):
+                    user_state_delta[key] = value
+                # else, it's a session-specific state key
+
+                # Update session.state (in-memory)
                 if value is None:
                     session.state.pop(key, None)
                     current_persisted_state_keys_values[key] = None
@@ -246,9 +300,22 @@ class Neo4jSessionService(BaseSessionService):
         # Client's last known session update time in milliseconds for optimistic locking
         # session.last_update_time is in seconds (float)
         client_last_update_time_ms = int(session.last_update_time * 1000)
-
+ 
         query = """
-        MATCH (s:Session {id: $session_id, app_name: $app_name, user_id: $user_id})
+        // P7: Update AppState if app_state_delta is provided
+        FOREACH (ignoreMe IN CASE WHEN size(keys($app_state_delta)) > 0 THEN [1] ELSE [] END |
+            MERGE (as:AppState {app_name: $app_name})
+            ON CREATE SET as.state_json = apoc.convert.toJson($app_state_delta), as.version = timestamp()
+            ON MATCH SET as.state_json = apoc.convert.toJson(apoc.map.merge(CASE WHEN as.state_json IS NULL THEN {} ELSE apoc.convert.fromJsonMap(as.state_json) END, $app_state_delta)), as.version = timestamp()
+        )
+        // P7: Update UserState if user_state_delta is provided
+        FOREACH (ignoreMe IN CASE WHEN size(keys($user_state_delta)) > 0 THEN [1] ELSE [] END |
+            MERGE (us:UserState {app_name: $app_name, user_id: $user_id})
+            ON CREATE SET us.state_json = apoc.convert.toJson($user_state_delta), us.version = timestamp()
+            ON MATCH SET us.state_json = apoc.convert.toJson(apoc.map.merge(CASE WHEN us.state_json IS NULL THEN {} ELSE apoc.convert.fromJsonMap(us.state_json) END, $user_state_delta)), us.version = timestamp()
+        )
+        WITH $session_id AS session_id, $app_name AS app_name, $user_id AS user_id // Carry over parameters explicitly
+        MATCH (s:Session {id: session_id, app_name: app_name, user_id: user_id})
         WHERE s.last_update_time = $client_last_update_time_ms
         
         // If match successful, update session timestamp immediately
@@ -268,17 +335,13 @@ class Neo4jSessionService(BaseSessionService):
         FOREACH (_ IN CASE WHEN prev_event IS NOT NULL THEN [1] ELSE [] END |
           CREATE (prev_event)-[:NEXT]->(e))
           
-        // Create WROTE_STATE relationships for persisted state changes
-        WITH s, e // s is the session, e is the new event
-        UNWIND keys($current_persisted_state_keys_values) AS k
-          WITH s, e, k,
-               $previous_values_for_delta[k] AS fromVal,
-               $current_persisted_state_keys_values[k] AS toVal
-          // e.timestamp is from event_props, in seconds. Convert to ms if DB expects ms for WROTE_STATE.
-          // Assuming WROTE_STATE timestamp should align with event's timestamp.
-          // The schema description for WROTE_STATE has 'timestamp', not specifying unit.
-          // Let's assume e.timestamp (seconds) is fine, or convert if needed: e.g. e.timestamp * 1000
-          CREATE (e)-[:WROTE_STATE {key: k, fromValue_json: CASE WHEN fromVal IS NOT NULL THEN apoc.convert.toJson(fromVal) ELSE null END, toValue_json: CASE WHEN toVal IS NOT NULL THEN apoc.convert.toJson(toVal) ELSE null END, timestamp: e.timestamp}]->(s)
+        // Create WROTE_STATE relationships for persisted state changes (session-specific keys)
+        WITH s, e
+        UNWIND [k IN keys($current_persisted_state_keys_values) WHERE NOT (k STARTS WITH 'app:' OR k STARTS WITH 'user:')] AS k_session
+          WITH s, e, k_session,
+               $previous_values_for_delta[k_session] AS fromVal,
+               $current_persisted_state_keys_values[k_session] AS toVal
+          CREATE (e)-[:WROTE_STATE {key: k_session, fromValue_json: CASE WHEN fromVal IS NOT NULL THEN apoc.convert.toJson(fromVal) ELSE null END, toValue_json: CASE WHEN toVal IS NOT NULL THEN apoc.convert.toJson(toVal) ELSE null END, timestamp: e.timestamp}]->(s)
 
         // Create INVOKED_TOOL relationships
         WITH e, s // Pass s along if needed, though not directly used in UNWIND tool_calls
@@ -299,10 +362,12 @@ class Neo4jSessionService(BaseSessionService):
             "new_session_state_json": json.dumps(session.state), # New state applied to session.state in Python
             "event_props": event_props_for_cypher, # Contains event.id, event.timestamp (seconds), etc.
             "previous_values_for_delta": previous_values_for_delta,
-            "current_persisted_state_keys_values": current_persisted_state_keys_values,
-            "tool_calls_data": tool_calls_for_cypher
+            "current_persisted_state_keys_values": current_persisted_state_keys_values, # Contains all non-temp keys
+            "tool_calls_data": tool_calls_for_cypher,
+            "app_state_delta": app_state_delta, # P7
+            "user_state_delta": user_state_delta # P7
         }
-
+ 
         result = self._execute_write(query, params)
         
         if not result or not result[0].get("new_session_last_update_time_ms"):

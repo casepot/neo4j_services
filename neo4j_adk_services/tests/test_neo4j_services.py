@@ -47,6 +47,17 @@ class TestNeo4jServices(unittest.TestCase):
             def run(self, query, parameters=None, **kwargs):
                 # Simulate behavior for DDL statements in __init__
                 if "CREATE CONSTRAINT" in query and "IF NOT EXISTS" in query:
+                    # Simulate constraint creation for AppState and UserState as well
+                    if "FOR (a:AppState)" in query and 'app_state_unique' in self.test_case_ref.simulated_existing_indexes:
+                         raise neo4j.exceptions.ClientError("An equivalent constraint already exists: app_state_unique")
+                    if "FOR (a:AppState)" in query:
+                        self.test_case_ref.simulated_existing_indexes.add('app_state_unique')
+                    
+                    if "FOR (u:UserState)" in query and 'user_state_unique' in self.test_case_ref.simulated_existing_indexes:
+                        raise neo4j.exceptions.ClientError("An equivalent constraint already exists: user_state_unique")
+                    if "FOR (u:UserState)" in query:
+                        self.test_case_ref.simulated_existing_indexes.add('user_state_unique')
+
                     return MockNeo4jRun()
                 if "CALL db.index.fulltext.createNodeIndex('MemoryTextIndex', ['MemoryChunk']" in query:
                     if 'MemoryTextIndex' in self.test_case_ref.simulated_existing_indexes:
@@ -100,7 +111,11 @@ class TestNeo4jServices(unittest.TestCase):
             self.fail(f"Service re-initialization failed unexpectedly: {e}")
 
         # Mock database dictionary, attached to the test case instance
-        self._db = {"sessions": {}, "events": {}, "next_rels": {}, "memory_chunks": {}, "tool_calls": {}} 
+        self._db = {
+            "sessions": {}, "events": {}, "next_rels": {},
+            "memory_chunks": {}, "tool_calls": {},
+            "app_states": {}, "user_states": {} # For P7
+        }
         
         # Patch close methods to track closure
         self.session_service_driver_closed = False
@@ -137,6 +152,8 @@ class TestNeo4jServices(unittest.TestCase):
                 sid, app_name, user_id = params["session_id"], params["app_name"], params["user_id"]
                 sess_key = (app_name, user_id, sid)
                 current_time_ms = int(time.time() * 1000)
+                
+                # P7: state_json in params already includes merged shadow states from fake_execute_read_session
                 _db["sessions"][sess_key] = {
                     "app_name": app_name, "user_id": user_id, "id": sid,
                     "state_json": params["state_json"], "last_update_time": current_time_ms
@@ -145,8 +162,44 @@ class TestNeo4jServices(unittest.TestCase):
                          "state_json": params["state_json"], "last_update_time": current_time_ms}]
             
             # Mock for append_event
-            elif "WHERE s.last_update_time = $client_last_update_time_ms" in query and "CREATE (e:Event)-[:OF_SESSION]->(s)" in query:
-                sid, app_name, user_id = params["session_id"], params["app_name"], params["user_id"]
+            # This mock needs to handle P7 shadow state updates now
+            elif "FOREACH (ignoreMe IN CASE WHEN size(keys($app_state_delta)) > 0 THEN [1] ELSE [] END |" in query or \
+                 "WHERE s.last_update_time = $client_last_update_time_ms" in query and "CREATE (e:Event)-[:OF_SESSION]->(s)" in query:
+                
+                app_name = params["app_name"]
+                user_id = params["user_id"]
+                
+                # P7: Simulate AppState update
+                app_state_delta = params.get("app_state_delta", {})
+                if app_state_delta:
+                    app_key = app_name
+                    current_app_state_json = _db["app_states"].get(app_key, {}).get("state_json", "{}")
+                    current_app_state = json.loads(current_app_state_json)
+                    # Simulate apoc.map.merge
+                    for k, v in app_state_delta.items():
+                        if v is None: current_app_state.pop(k, None)
+                        else: current_app_state[k] = v
+                    _db["app_states"][app_key] = {
+                        "state_json": json.dumps(current_app_state),
+                        "version": int(time.time() * 1000)
+                    }
+
+                # P7: Simulate UserState update
+                user_state_delta = params.get("user_state_delta", {})
+                if user_state_delta:
+                    user_key = (app_name, user_id)
+                    current_user_state_json = _db["user_states"].get(user_key, {}).get("state_json", "{}")
+                    current_user_state = json.loads(current_user_state_json)
+                    for k, v in user_state_delta.items():
+                        if v is None: current_user_state.pop(k, None)
+                        else: current_user_state[k] = v
+                    _db["user_states"][user_key] = {
+                        "state_json": json.dumps(current_user_state),
+                        "version": int(time.time() * 1000)
+                    }
+
+                # Continue with existing append_event mock logic for Session and Event
+                sid = params["session_id"]
                 sess_key = (app_name, user_id, sid)
                 if sess_key not in _db["sessions"]: return []
                 
@@ -199,7 +252,7 @@ class TestNeo4jServices(unittest.TestCase):
             # For get_session: Check for key elements
             if "MATCH (s:Session {" in query and \
                "OPTIONAL MATCH (s)-[:HAS_EVENT]->(e:Event)" in query and \
-               "RETURN s, collect(e) AS events" in query:
+               "RETURN s, collect(e) AS events" in query: # This is get_session
                 sess_key = (params["app_name"], params["user_id"], params["session_id"])
                 session_node_data = _db["sessions"].get(sess_key)
                 if not session_node_data: return [] # Session not found in mock
@@ -209,6 +262,22 @@ class TestNeo4jServices(unittest.TestCase):
                 collected_events_data.sort(key=lambda e: e.get("timestamp", 0))
                 # Return a copy of the session data as well
                 return [{"s": dict(session_node_data), "events": collected_events_data}]
+
+            # P7: Mock for create_session's AppState read
+            elif "OPTIONAL MATCH (as:AppState {app_name: $app_name})" in query:
+                app_name_param = params["app_name"]
+                app_state_data = _db["app_states"].get(app_name_param)
+                if app_state_data:
+                    return [{"app_state_json": app_state_data.get("state_json"), "app_state_version": app_state_data.get("version")}]
+                return [{"app_state_json": None, "app_state_version": None}]
+
+            # P7: Mock for create_session's UserState read
+            elif "OPTIONAL MATCH (us:UserState {app_name: $app_name, user_id: $user_id})" in query:
+                user_key_param = (params["app_name"], params["user_id"])
+                user_state_data = _db["user_states"].get(user_key_param)
+                if user_state_data:
+                    return [{"user_state_json": user_state_data.get("state_json"), "user_state_version": user_state_data.get("version")}]
+                return [{"user_state_json": None, "user_state_version": None}]
 
             # For list_sessions:
             elif "RETURN s.id AS session_id, s.last_update_time AS last_update" in query:
@@ -365,8 +434,16 @@ class TestNeo4jServices(unittest.TestCase):
             fetched_event = fetched.events[0]
             self.assertEqual(fetched_event.id, evt.id)
             self.assertEqual(fetched_event.author, evt.author)
-            self.assertTrue(fetched_event.content and fetched_event.content.parts[0].text == "Hello world")
             
+            # Verify content_json hydration (P6)
+            self.assertIsNotNone(fetched_event.content, "Fetched event content should not be None")
+            self.assertIsInstance(fetched_event.content, types.Content, "Fetched event content should be of type types.Content")
+            self.assertEqual(len(fetched_event.content.parts), 1, "Fetched event content should have one part")
+            self.assertIsInstance(fetched_event.content.parts[0], types.Part, "Fetched event content part should be of type types.Part")
+            self.assertEqual(fetched_event.content.parts[0].text, "Hello world", "Fetched event content text does not match")
+            # Ensure full content object matches (if Content is a Pydantic model, equality should work)
+            self.assertEqual(fetched_event.content, evt_content, "Full fetched event content should match original")
+
             # Check actions reconstruction
             # Note: Dummy EventActions might not have model_dump, adjust if using real ADK
             if fetched_event.actions and hasattr(evt_actions, 'model_dump'):
@@ -520,7 +597,7 @@ class TestNeo4jServices(unittest.TestCase):
         self.assertGreaterEqual(len(path_result), 1, "Query for e1->...->e3 should find a path.")
         if path_result: 
              self.assertEqual(path_result[0]["c"]["id"], evt3.id, "The end of the e1->...->e3 path should be e3.")
-
+ 
     def test_append_event_with_tool_calls(self):
         """Verify ToolCall nodes and INVOKED_TOOL relationships are created."""
         sess = self.session_service.create_session(app_name="test_tool", user_id="user_tool")
@@ -578,3 +655,357 @@ class TestNeo4jServices(unittest.TestCase):
 # def test_wrote_state_edge_creation(self):
 #     """Test that WROTE_STATE edge is part of the Cypher query when state changes."""
 #     pass
+
+    def test_p7_shadow_app_state_creation_and_update(self):
+        """Test P7: AppState node creation and update via append_event."""
+        app_name = "p7_app_test"
+        user_id = "p7_user"
+        
+        # Initial session, no app-specific state yet
+        sess = self.session_service.create_session(app_name=app_name, user_id=user_id)
+        self.assertNotIn(app_name, self._db["app_states"], "AppState should not exist yet.")
+
+        # Event with app-specific delta
+        evt_actions1 = EventActions(state_delta={"app:theme": "dark", "app:feature_flag_x": True, "session_key": "val1"})
+        evt1 = Event(author="user", content=types.Content(parts=[types.Part(text="Set app theme")]), actions=evt_actions1)
+        self.session_service.append_event(sess, evt1)
+
+        self.assertIn(app_name, self._db["app_states"], "AppState should be created.")
+        app_state_node = self._db["app_states"][app_name]
+        app_state_data = json.loads(app_state_node["state_json"])
+        self.assertEqual(app_state_data.get("app:theme"), "dark")
+        self.assertTrue(app_state_data.get("app:feature_flag_x"))
+        self.assertNotIn("session_key", app_state_data, "Session specific key should not be in AppState")
+        self.assertIsNotNone(app_state_node.get("version"))
+        original_app_version = app_state_node.get("version")
+
+        # Event with another app-specific delta (update and new key)
+        evt_actions2 = EventActions(state_delta={"app:theme": "light", "app:new_setting": "enabled"})
+        evt2 = Event(author="user", content=types.Content(parts=[types.Part(text="Update app theme")]), actions=evt_actions2)
+        time.sleep(0.001) # ensure timestamp difference for version
+        self.session_service.append_event(sess, evt2)
+        
+        app_state_node_updated = self._db["app_states"][app_name]
+        app_state_data_updated = json.loads(app_state_node_updated["state_json"])
+        self.assertEqual(app_state_data_updated.get("app:theme"), "light")
+        self.assertTrue(app_state_data_updated.get("app:feature_flag_x"), "Original app key should persist")
+        self.assertEqual(app_state_data_updated.get("app:new_setting"), "enabled")
+        self.assertTrue(app_state_node_updated.get("version") > original_app_version, "AppState version should be updated")
+
+        # Event removing an app-specific key
+        evt_actions3 = EventActions(state_delta={"app:feature_flag_x": None})
+        evt3 = Event(author="user", content=types.Content(parts=[types.Part(text="Remove app feature flag")]), actions=evt_actions3)
+        time.sleep(0.001)
+        self.session_service.append_event(sess, evt3)
+
+        app_state_node_final = self._db["app_states"][app_name]
+        app_state_data_final = json.loads(app_state_node_final["state_json"])
+        self.assertNotIn("app:feature_flag_x", app_state_data_final, "app:feature_flag_x should be removed from AppState")
+        self.assertEqual(app_state_data_final.get("app:theme"), "light", "app:theme should still be light")
+
+
+    def test_p7_shadow_user_state_creation_and_update(self):
+        """Test P7: UserState node creation and update via append_event."""
+        app_name = "p7_user_test_app"
+        user_id = "p7_user1"
+        user_key = (app_name, user_id)
+
+        sess = self.session_service.create_session(app_name=app_name, user_id=user_id)
+        self.assertNotIn(user_key, self._db["user_states"], "UserState should not exist yet.")
+
+        evt_actions1 = EventActions(state_delta={"user:preference": "notifications_on", "user:language": "en", "session_detail": "abc"})
+        evt1 = Event(author="user", content=types.Content(parts=[types.Part(text="Set user preference")]), actions=evt_actions1)
+        self.session_service.append_event(sess, evt1)
+
+        self.assertIn(user_key, self._db["user_states"], "UserState should be created.")
+        user_state_node = self._db["user_states"][user_key]
+        user_state_data = json.loads(user_state_node["state_json"])
+        self.assertEqual(user_state_data.get("user:preference"), "notifications_on")
+        self.assertEqual(user_state_data.get("user:language"), "en")
+        self.assertNotIn("session_detail", user_state_data, "Session specific key should not be in UserState")
+        original_user_version = user_state_node.get("version")
+
+        evt_actions2 = EventActions(state_delta={"user:language": "fr", "user:last_login_ip": "1.2.3.4"})
+        evt2 = Event(author="user", content=types.Content(parts=[types.Part(text="Update user language")]), actions=evt_actions2)
+        time.sleep(0.001)
+        self.session_service.append_event(sess, evt2)
+
+        user_state_node_updated = self._db["user_states"][user_key]
+        user_state_data_updated = json.loads(user_state_node_updated["state_json"])
+        self.assertEqual(user_state_data_updated.get("user:preference"), "notifications_on")
+        self.assertEqual(user_state_data_updated.get("user:language"), "fr")
+        self.assertEqual(user_state_data_updated.get("user:last_login_ip"), "1.2.3.4")
+        self.assertTrue(user_state_node_updated.get("version") > original_user_version)
+
+    def test_p7_create_session_merges_shadow_states(self):
+        """Test P7: create_session merges existing AppState and UserState."""
+        app_name = "p7_merge_app"
+        user_id1 = "p7_merge_user1"
+        user_id2 = "p7_merge_user2" # Another user for distinct UserState
+
+        # Pre-populate AppState
+        self._db["app_states"][app_name] = {
+            "state_json": json.dumps({"app:global_setting": "active", "app:common_pref": "default_app"}),
+            "version": int(time.time() * 1000)
+        }
+        # Pre-populate UserState for user1
+        user1_key = (app_name, user_id1)
+        self._db["user_states"][user1_key] = {
+            "state_json": json.dumps({"user:theme": "dark_user1", "user:custom_data": "user1_specific"}),
+            "version": int(time.time() * 1000)
+        }
+
+        # Create session for user1, with some initial session-specific state
+        # and an overlapping app-prefixed key to test merge behavior (shadow should win for its keys)
+        sess1 = self.session_service.create_session(
+            app_name=app_name,
+            user_id=user_id1,
+            state={"session_key": "val_s1", "app:common_pref": "session_override_app", "user:theme":"session_override_user"}
+        )
+        
+        # Check merged state in the live Session object
+        self.assertEqual(sess1.state.get("app:global_setting"), "active", "AppState global_setting missing")
+        self.assertEqual(sess1.state.get("app:common_pref"), "default_app", "AppState common_pref should be merged from shadow")
+        self.assertEqual(sess1.state.get("user:theme"), "dark_user1", "UserState theme should be merged from shadow")
+        self.assertEqual(sess1.state.get("user:custom_data"), "user1_specific", "UserState custom_data missing")
+        self.assertEqual(sess1.state.get("session_key"), "val_s1", "Session-specific key missing")
+        
+        # Verify the state_json stored for the session node in the mock DB also reflects this merge
+        session_node_data = self._db["sessions"].get((app_name, user_id1, sess1.id))
+        self.assertIsNotNone(session_node_data)
+        stored_session_state = json.loads(session_node_data["state_json"])
+        self.assertEqual(stored_session_state.get("app:global_setting"), "active")
+        self.assertEqual(stored_session_state.get("app:common_pref"), "default_app")
+        self.assertEqual(stored_session_state.get("user:theme"), "dark_user1")
+        self.assertEqual(stored_session_state.get("user:custom_data"), "user1_specific")
+        self.assertEqual(stored_session_state.get("session_key"), "val_s1")
+
+        # Create session for user2 (should only get AppState, not UserState from user1)
+        sess2 = self.session_service.create_session(app_name=app_name, user_id=user_id2, state={"session_key2": "val_s2"})
+        self.assertEqual(sess2.state.get("app:global_setting"), "active")
+        self.assertEqual(sess2.state.get("app:common_pref"), "default_app")
+        self.assertIsNone(sess2.state.get("user:theme")) # Should not get user1's theme
+        self.assertEqual(sess2.state.get("session_key2"), "val_s2")
+
+    def test_p7_wrote_state_excludes_shadow_keys(self):
+        """Test P7: WROTE_STATE relationships are not created for app: or user: prefixed keys."""
+        app_name = "p7_wrote_state_app"
+        user_id = "p7_wrote_state_user"
+        sess = self.session_service.create_session(app_name=app_name, user_id=user_id)
+
+        # Event with mixed state deltas
+        evt_actions = EventActions(state_delta={
+            "app:config": "new_app_config",
+            "user:profile_status": "active_user",
+            "session_data_point": "xyz123",
+            "another_session_key": None # to test removal
+        })
+        evt = Event(author="user", content=types.Content(parts=[types.Part(text="Mixed state update")]), actions=evt_actions)
+        
+        # Clear last_write_query_string before append_event
+        self.last_write_query_string = None
+        self.session_service.append_event(sess, evt)
+        
+        # Inspect the Cypher query that was executed by the mock
+        executed_cypher = self.last_write_query_string
+        self.assertIsNotNone(executed_cypher)
+
+        # Check that UNWIND for WROTE_STATE filters out app: and user: keys
+        # This is a string check on the Cypher, which is a bit brittle but direct for this mock.
+        # A more robust check would involve inspecting the parameters passed to the mock _execute_write,
+        # specifically 'current_persisted_state_keys_values' after filtering.
+        self.assertIn("UNWIND [k IN keys($current_persisted_state_keys_values) WHERE NOT (k STARTS WITH 'app:' OR k STARTS WITH 'user:')] AS k_session", executed_cypher)
+        
+        # Further check: The parameters passed to the mock for WROTE_STATE should reflect this.
+        # The mock's fake_execute_write_session doesn't currently store the exact parameters for WROTE_STATE creation
+        # in a way that's easily assertable here. The Cypher string check is the primary test for now.
+        # If the mock was more detailed, we could check:
+        # mock_params = self.session_service._last_params_for_append_event (if we stored it)
+        # self.assertNotIn("app:config", mock_params["current_persisted_state_keys_values_for_wrote_state"])
+        # self.assertNotIn("user:profile_status", mock_params["current_persisted_state_keys_values_for_wrote_state"])
+        # self.assertIn("session_data_point", mock_params["current_persisted_state_keys_values_for_wrote_state"])
+        
+        # As a proxy, check that AppState and UserState were updated (implies keys were processed by shadow logic)
+        self.assertIn(app_name, self._db["app_states"])
+        self.assertEqual(json.loads(self._db["app_states"][app_name]["state_json"]).get("app:config"), "new_app_config")
+        
+        user_key = (app_name, user_id)
+        self.assertIn(user_key, self._db["user_states"])
+        self.assertEqual(json.loads(self._db["user_states"][user_key]["state_json"]).get("user:profile_status"), "active_user")
+
+    def test_p7_shadow_app_state_creation_and_update(self):
+        """Test P7: AppState node creation and update via append_event."""
+        app_name = "p7_app_test"
+        user_id = "p7_user"
+        
+        # Initial session, no app-specific state yet
+        sess = self.session_service.create_session(app_name=app_name, user_id=user_id)
+        self.assertNotIn(app_name, self._db["app_states"], "AppState should not exist yet.")
+
+        # Event with app-specific delta
+        evt_actions1 = EventActions(state_delta={"app:theme": "dark", "app:feature_flag_x": True, "session_key": "val1"})
+        evt1 = Event(author="user", content=types.Content(parts=[types.Part(text="Set app theme")]), actions=evt_actions1)
+        self.session_service.append_event(sess, evt1)
+
+        self.assertIn(app_name, self._db["app_states"], "AppState should be created.")
+        app_state_node = self._db["app_states"][app_name]
+        app_state_data = json.loads(app_state_node["state_json"])
+        self.assertEqual(app_state_data.get("app:theme"), "dark")
+        self.assertTrue(app_state_data.get("app:feature_flag_x"))
+        self.assertNotIn("session_key", app_state_data, "Session specific key should not be in AppState")
+        self.assertIsNotNone(app_state_node.get("version"))
+        original_app_version = app_state_node.get("version")
+
+        # Event with another app-specific delta (update and new key)
+        evt_actions2 = EventActions(state_delta={"app:theme": "light", "app:new_setting": "enabled"})
+        evt2 = Event(author="user", content=types.Content(parts=[types.Part(text="Update app theme")]), actions=evt_actions2)
+        time.sleep(0.001) # ensure timestamp difference for version
+        self.session_service.append_event(sess, evt2)
+        
+        app_state_node_updated = self._db["app_states"][app_name]
+        app_state_data_updated = json.loads(app_state_node_updated["state_json"])
+        self.assertEqual(app_state_data_updated.get("app:theme"), "light")
+        self.assertTrue(app_state_data_updated.get("app:feature_flag_x"), "Original app key should persist")
+        self.assertEqual(app_state_data_updated.get("app:new_setting"), "enabled")
+        self.assertTrue(app_state_node_updated.get("version") > original_app_version, "AppState version should be updated")
+
+        # Event removing an app-specific key
+        evt_actions3 = EventActions(state_delta={"app:feature_flag_x": None})
+        evt3 = Event(author="user", content=types.Content(parts=[types.Part(text="Remove app feature flag")]), actions=evt_actions3)
+        time.sleep(0.001)
+        self.session_service.append_event(sess, evt3)
+
+        app_state_node_final = self._db["app_states"][app_name]
+        app_state_data_final = json.loads(app_state_node_final["state_json"])
+        self.assertNotIn("app:feature_flag_x", app_state_data_final, "app:feature_flag_x should be removed from AppState")
+        self.assertEqual(app_state_data_final.get("app:theme"), "light", "app:theme should still be light")
+
+
+    def test_p7_shadow_user_state_creation_and_update(self):
+        """Test P7: UserState node creation and update via append_event."""
+        app_name = "p7_user_test_app"
+        user_id = "p7_user1"
+        user_key = (app_name, user_id)
+
+        sess = self.session_service.create_session(app_name=app_name, user_id=user_id)
+        self.assertNotIn(user_key, self._db["user_states"], "UserState should not exist yet.")
+
+        evt_actions1 = EventActions(state_delta={"user:preference": "notifications_on", "user:language": "en", "session_detail": "abc"})
+        evt1 = Event(author="user", content=types.Content(parts=[types.Part(text="Set user preference")]), actions=evt_actions1)
+        self.session_service.append_event(sess, evt1)
+
+        self.assertIn(user_key, self._db["user_states"], "UserState should be created.")
+        user_state_node = self._db["user_states"][user_key]
+        user_state_data = json.loads(user_state_node["state_json"])
+        self.assertEqual(user_state_data.get("user:preference"), "notifications_on")
+        self.assertEqual(user_state_data.get("user:language"), "en")
+        self.assertNotIn("session_detail", user_state_data, "Session specific key should not be in UserState")
+        original_user_version = user_state_node.get("version")
+
+        evt_actions2 = EventActions(state_delta={"user:language": "fr", "user:last_login_ip": "1.2.3.4"})
+        evt2 = Event(author="user", content=types.Content(parts=[types.Part(text="Update user language")]), actions=evt_actions2)
+        time.sleep(0.001)
+        self.session_service.append_event(sess, evt2)
+
+        user_state_node_updated = self._db["user_states"][user_key]
+        user_state_data_updated = json.loads(user_state_node_updated["state_json"])
+        self.assertEqual(user_state_data_updated.get("user:preference"), "notifications_on")
+        self.assertEqual(user_state_data_updated.get("user:language"), "fr")
+        self.assertEqual(user_state_data_updated.get("user:last_login_ip"), "1.2.3.4")
+        self.assertTrue(user_state_node_updated.get("version") > original_user_version)
+
+    def test_p7_create_session_merges_shadow_states(self):
+        """Test P7: create_session merges existing AppState and UserState."""
+        app_name = "p7_merge_app"
+        user_id1 = "p7_merge_user1"
+        user_id2 = "p7_merge_user2" # Another user for distinct UserState
+
+        # Pre-populate AppState
+        self._db["app_states"][app_name] = {
+            "state_json": json.dumps({"app:global_setting": "active", "app:common_pref": "default_app"}),
+            "version": int(time.time() * 1000)
+        }
+        # Pre-populate UserState for user1
+        user1_key = (app_name, user_id1)
+        self._db["user_states"][user1_key] = {
+            "state_json": json.dumps({"user:theme": "dark_user1", "user:custom_data": "user1_specific"}),
+            "version": int(time.time() * 1000)
+        }
+
+        # Create session for user1, with some initial session-specific state
+        # and an overlapping app-prefixed key to test merge behavior (shadow should win for its keys)
+        sess1 = self.session_service.create_session(
+            app_name=app_name,
+            user_id=user_id1,
+            state={"session_key": "val_s1", "app:common_pref": "session_override_app", "user:theme":"session_override_user"}
+        )
+        
+        # Check merged state in the live Session object
+        self.assertEqual(sess1.state.get("app:global_setting"), "active", "AppState global_setting missing")
+        self.assertEqual(sess1.state.get("app:common_pref"), "default_app", "AppState common_pref should be merged from shadow")
+        self.assertEqual(sess1.state.get("user:theme"), "dark_user1", "UserState theme should be merged from shadow")
+        self.assertEqual(sess1.state.get("user:custom_data"), "user1_specific", "UserState custom_data missing")
+        self.assertEqual(sess1.state.get("session_key"), "val_s1", "Session-specific key missing")
+        
+        # Verify the state_json stored for the session node in the mock DB also reflects this merge
+        session_node_data = self._db["sessions"].get((app_name, user_id1, sess1.id))
+        self.assertIsNotNone(session_node_data)
+        stored_session_state = json.loads(session_node_data["state_json"])
+        self.assertEqual(stored_session_state.get("app:global_setting"), "active")
+        self.assertEqual(stored_session_state.get("app:common_pref"), "default_app")
+        self.assertEqual(stored_session_state.get("user:theme"), "dark_user1")
+        self.assertEqual(stored_session_state.get("user:custom_data"), "user1_specific")
+        self.assertEqual(stored_session_state.get("session_key"), "val_s1")
+
+        # Create session for user2 (should only get AppState, not UserState from user1)
+        sess2 = self.session_service.create_session(app_name=app_name, user_id=user_id2, state={"session_key2": "val_s2"})
+        self.assertEqual(sess2.state.get("app:global_setting"), "active")
+        self.assertEqual(sess2.state.get("app:common_pref"), "default_app")
+        self.assertIsNone(sess2.state.get("user:theme")) # Should not get user1's theme
+        self.assertEqual(sess2.state.get("session_key2"), "val_s2")
+
+    def test_p7_wrote_state_excludes_shadow_keys(self):
+        """Test P7: WROTE_STATE relationships are not created for app: or user: prefixed keys."""
+        app_name = "p7_wrote_state_app"
+        user_id = "p7_wrote_state_user"
+        sess = self.session_service.create_session(app_name=app_name, user_id=user_id)
+
+        # Event with mixed state deltas
+        evt_actions = EventActions(state_delta={
+            "app:config": "new_app_config",
+            "user:profile_status": "active_user",
+            "session_data_point": "xyz123",
+            "another_session_key": None # to test removal
+        })
+        evt = Event(author="user", content=types.Content(parts=[types.Part(text="Mixed state update")]), actions=evt_actions)
+        
+        # Clear last_write_query_string before append_event
+        self.last_write_query_string = None
+        self.session_service.append_event(sess, evt)
+        
+        # Inspect the Cypher query that was executed by the mock
+        executed_cypher = self.last_write_query_string
+        self.assertIsNotNone(executed_cypher)
+
+        # Check that UNWIND for WROTE_STATE filters out app: and user: keys
+        # This is a string check on the Cypher, which is a bit brittle but direct for this mock.
+        # A more robust check would involve inspecting the parameters passed to the mock _execute_write,
+        # specifically 'current_persisted_state_keys_values' after filtering.
+        self.assertIn("UNWIND [k IN keys($current_persisted_state_keys_values) WHERE NOT (k STARTS WITH 'app:' OR k STARTS WITH 'user:')] AS k_session", executed_cypher)
+        
+        # Further check: The parameters passed to the mock for WROTE_STATE should reflect this.
+        # The mock's fake_execute_write_session doesn't currently store the exact parameters for WROTE_STATE creation
+        # in a way that's easily assertable here. The Cypher string check is the primary test for now.
+        # If the mock was more detailed, we could check:
+        # mock_params = self.session_service._last_params_for_append_event (if we stored it)
+        # self.assertNotIn("app:config", mock_params["current_persisted_state_keys_values_for_wrote_state"])
+        # self.assertNotIn("user:profile_status", mock_params["current_persisted_state_keys_values_for_wrote_state"])
+        # self.assertIn("session_data_point", mock_params["current_persisted_state_keys_values_for_wrote_state"])
+        
+        # As a proxy, check that AppState and UserState were updated (implies keys were processed by shadow logic)
+        self.assertIn(app_name, self._db["app_states"])
+        self.assertEqual(json.loads(self._db["app_states"][app_name]["state_json"]).get("app:config"), "new_app_config")
+        
+        user_key = (app_name, user_id)
+        self.assertIn(user_key, self._db["user_states"])
+        self.assertEqual(json.loads(self._db["user_states"][user_key]["state_json"]).get("user:profile_status"), "active_user")
