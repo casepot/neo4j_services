@@ -18,7 +18,12 @@ class Neo4jSessionService(BaseSessionService):
     """A SessionService implementation backed by Neo4j graph database."""
     def __init__(self, uri: str, user: str, password: str, database: str = None):
         # Initialize Neo4j driver (synchronous)
-        self._driver = GraphDatabase.driver(uri, auth=(user, password))
+        # Expecting plain bolt:// URI as TLS will be disabled in the container for tests
+        self._driver = GraphDatabase.driver(
+            uri, # Use the provided URI directly (expected to be bolt://)
+            auth=(user, password)
+            # No explicit encryption flags, relying on plain bolt connection
+        )
         self._database = database
         # Schema indexes/constraints for sessions and tool calls
         with self._driver.session(database=self._database) as db_session:

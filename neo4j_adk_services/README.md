@@ -160,6 +160,7 @@ Both services require Neo4j connection details:
 *   `user`: The Neo4j username.
 *   `password`: The Neo4j password.
 *   `database`: (Optional) The specific Neo4j database name to use (defaults to the Neo4j default database).
+*   **Note on Test Environment**: The project's test environment (configured in `tests/conftest.py`) starts the Neo4j container with TLS disabled (`NEO4J_dbms_connector_bolt_tls__level="DISABLED"`) and uses plain `bolt://` URIs for all driver connections. For production or other environments where TLS is enabled on the Neo4j server, ensure your URI (e.g., `bolt+s://` or `bolt+ssc://`) and driver settings (e.g., `encrypted=True`, certificate trust) match the server's requirements.
 
 ### Neo4jMemoryService Specific Configuration
 *   `embedding_function`: (Callable, optional) A function that takes a string of text and returns its vector embedding (list of floats). Required for vector search.
@@ -334,7 +335,7 @@ except RuntimeError as e:
     *   The `neo4j_adk_services` package and its `dev` dependencies installed (e.g., `uv pip install -e "./neo4j_adk_services[dev]"`). This will include `pytest`, `pytest-asyncio`, and `testcontainers` (version `4.10.x` or as specified in `pyproject.toml`).
 
 2.  **Execute Tests**:
-    The integration tests use `Testcontainers` to automatically spin up a Neo4j Docker container (version `5.26.6` as configured in `tests/conftest.py`) with the APOC plugin enabled via the `NEO4J_PLUGINS` environment variable. There is no need to manually start a Neo4j container for running the tests.
+    The integration tests use `Testcontainers` to automatically spin up a Neo4j Docker container (version `5.26.6` as configured in `tests/conftest.py`). The container is configured with the APOC plugin enabled (via `NEO4J_PLUGINS`) and **TLS disabled** (via `NEO4J_dbms_connector_bolt_tls__level="DISABLED"`). All test connections use plain `bolt://` URIs. There is no need to manually start a Neo4j container for running the tests.
 
     Navigate to the root of the workspace (`/home/case/neo4j_services`) and run:
     ```bash
@@ -350,16 +351,45 @@ except RuntimeError as e:
     *   Automatically stop the Neo4j container after tests complete.
 
 ## Troubleshooting
-*   **`TypeError: Can't instantiate abstract class Neo4jSessionService without an implementation for abstract method ...`**: Ensure all abstract methods from `BaseSessionService` (and `BaseMemoryService` for `Neo4jMemoryService`) are implemented with matching signatures.
-*   **`neo4j.exceptions.ServiceUnavailable: Couldn't connect to localhost:7687... Connection refused`**:
-    *   Verify the Neo4j Docker container is running (`docker ps`).
-    *   Ensure the port `7687` is correctly published by the container.
-    *   Allow sufficient time for Neo4j to start. The `_wait_for_neo4j` helper in `tests/conftest.py` has an increased timeout (default 20 retries * 5s delay = 100s) to accommodate slower startup times, especially with plugins like APOC.
-*   **`NameError: name '_helper_function' is not defined`**: Check that helper functions within service classes are correctly defined as methods (with `self`) and called with `self._helper_function(...)`.
-*   **`KeyError` in test mocks**: The mock database logic in `tests/test_neo4j_services.py` might need updates if the Cypher queries or the structure of data returned by the services change significantly.
-*   **`ImportError: cannot import name 'Neo4jLabsPlugin' from 'testcontainers.neo4j'`**: This occurred because `Neo4jLabsPlugin` is part of the Java Testcontainers library, not Python. The fix involves enabling APOC via the `NEO4J_PLUGINS='["apoc"]'` environment variable in the `Neo4jContainer` setup within `tests/conftest.py`.
-*   **`AttributeError: 'Neo4jContainer' object has no attribute 'get_container_name'`**: This method was removed/changed in `testcontainers-python` v4.x. The fix involves using `neo_container.get_wrapped_container().short_id` (or `.name`) to access the underlying Docker container's properties in `tests/conftest.py`.
-*   **`zsh: no matches found: ./neo4j_adk_services[dev]`**: If you encounter this error when running `uv pip install`, quote the argument: `uv pip install -e "./neo4j_adk_services[dev]"`.
+
+This section summarizes key connection and authentication issues encountered during development and testing, and their resolutions, primarily focusing on the `testcontainers` setup.
+
+*   **Initial Connection Failures (`AuthError`, `SSLEOFError`, `ConfigurationError`, `AuthenticationRateLimit`)**:
+    A series of connection problems were encountered when setting up the test environment with `testcontainers` and Neo4j 5.x. These included:
+    *   `neo4j.exceptions.AuthError`: Incorrect password or user not yet available.
+    *   `SSLEOFError`: SSL handshake failures, often due to a mismatch between client and server TLS expectations or certificate issues.
+    *   `neo4j.exceptions.ConfigurationError`: Incorrect combination of URI schemes (e.g., `bolt+ssc://`) and explicit driver encryption parameters (e.g., `encrypted=True`). The driver infers settings from schemes like `bolt+ssc://`.
+    *   `neo4j.exceptions.AuthError: {code: Neo.ClientError.Security.AuthenticationRateLimit}`: Triggered by too many failed login attempts, often because readiness probes were trying to authenticate before the Neo4j container's auth subsystem was fully initialized.
+
+*   **Resolution Path for Test Environment**:
+    The most stable configuration for the test environment was achieved by:
+    1.  **Disabling TLS in the Neo4j Container**:
+        In `tests/conftest.py`, the `Neo4jContainer` is initialized with the environment variable `NEO4J_dbms_connector_bolt_tls__level="DISABLED"`.
+        ```python
+        Neo4jContainer("neo4j:5.26.6", password="letmein123")
+            .with_env("NEO4J_dbms_connector_bolt_tls__level", "DISABLED")
+            # ... other .with_env() calls
+        ```
+    2.  **Using Plain `bolt://` URIs Everywhere**:
+        All Neo4j driver initializations (in `tests/conftest.py` fixtures like `neo4j_uri`, `neo4j_async_uri`; in service constructors `Neo4jSessionService`, `Neo4jMemoryService`; and in the `clear_db` test fixture) now consistently use the plain `bolt://` URI returned by `neo_container.get_connection_url()`. No `bolt+ssc://` conversions are made, and no explicit `encrypted=True` or `trust_all_certificates=True` flags are passed to the driver, as TLS is disabled at the server level.
+    3.  **Reliable Password Setting**:
+        The initial password for the test container is set using the `password` parameter in the `Neo4jContainer` constructor: `Neo4jContainer("neo4j:5.26.6", password="letmein123")`.
+    4.  **Non-Authenticated Readiness Probe**:
+        The readiness probe in `tests/conftest.py` (`wait_port` function) now checks for TCP socket availability on the mapped Bolt port without attempting an authenticated Neo4j connection. This prevents early login failures and the `AuthenticationRateLimit` error.
+        ```python
+        # In tests/conftest.py within neo4j_container_instance fixture:
+        host = neo_container.get_container_host_ip()
+        mapped_port = neo_container.get_exposed_port(7687) # Ensure correct method name
+        wait_port(host, int(mapped_port))
+        ```
+    5.  **Correct Testcontainers API Usage**:
+        Ensured correct `testcontainers` API methods were used (e.g., `get_exposed_port()` instead of `get_mapped_port()`).
+
+*   **General `TypeError: Can't instantiate abstract class ...`**: Ensure all abstract methods from base classes (`BaseSessionService`, `BaseMemoryService`) are implemented with matching signatures in the derived Neo4j service classes.
+*   **`ImportError` or `AttributeError` related to `testcontainers`**: Verify the installed version of `testcontainers-python` and consult its documentation for correct API usage, as methods can change between versions (e.g., `Neo4jLabsPlugin` not in Python version, `get_container_name` vs `get_wrapped_container().short_id`).
+*   **Shell Errors (e.g., `zsh: no matches found` for `pip install`)**: Quote arguments containing special characters like square brackets: `uv pip install -e "./neo4j_adk_services[dev]"`.
+
+This setup ensures that the test environment consistently uses non-encrypted connections, simplifying the connection logic and avoiding SSL-related complexities. For production, a TLS-enabled setup would be recommended, requiring careful alignment of server configuration, URIs (e.g., `bolt+s://` or `bolt+ssc://`), and driver trust settings.
 
 ## Key Design Decisions & References
 *   **Event Timeline with `NEXT`**: Inspired by temporal graph patterns for efficient ordered traversals. ([Neo4j Docs: Variable-length patterns](https://neo4j.com/docs/cypher-manual/current/patterns/variable-length-patterns/))

@@ -16,7 +16,12 @@ class Neo4jMemoryService(BaseMemoryService):
     def __init__(self, uri: str, user: str, password: str, database: str = None,
                  embedding_function: callable = None, vector_dimension: int = None, similarity_top_k: int = 5,
                  vector_distance_threshold: float = None, max_concurrent_requests: int = 10):
-        self._driver = AsyncGraphDatabase.driver(uri, auth=(user, password)) # Changed to AsyncGraphDatabase
+        # Expecting plain bolt:// URI as TLS will be disabled in the container for tests
+        self._driver = AsyncGraphDatabase.driver(
+            uri, # Use the provided URI directly (expected to be bolt://)
+            auth=(user, password)
+            # No explicit encryption flags, relying on plain bolt connection
+        )
         self._database = database
         self._embedding_fn = embedding_function
         self._vector_dim = vector_dimension # Configured dimension for index creation

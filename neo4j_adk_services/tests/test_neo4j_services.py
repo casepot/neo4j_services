@@ -32,12 +32,16 @@ def get_test_embedding(text: str) -> list[float]:
     return embedding
 
 @pytest.fixture(scope="function")
-async def clear_db(neo4j_uri, neo4j_auth):
+def clear_db(neo4j_uri, neo4j_auth): # Changed to synchronous fixture
     """Clears all data from the Neo4j database before each test function."""
     driver = None
     try:
-        # Use sync driver for cleanup as it's simpler for DDL-like operations
-        driver = GraphDatabase.driver(neo4j_uri, auth=neo4j_auth)
+        # Expecting plain bolt:// URI as TLS will be disabled in the container
+        driver = GraphDatabase.driver(
+            neo4j_uri, # Use the provided URI directly (expected to be bolt://)
+            auth=neo4j_auth
+            # No explicit encryption flags, relying on plain bolt connection
+        )
         with driver.session(database="neo4j") as session:
             session.run("MATCH (n) DETACH DELETE n")
             # Optionally, remove indexes and constraints if they interfere,

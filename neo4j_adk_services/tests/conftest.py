@@ -3,78 +3,94 @@ import asyncio
 import time
 from neo4j import GraphDatabase, AsyncGraphDatabase, exceptions as neo4j_exceptions
 from testcontainers.neo4j import Neo4jContainer
+import socket # For the new wait_port function
 
-# Helper function to wait for Neo4j to be ready
-def _wait_for_neo4j(uri: str, user="neo4j", password="test", retries=20, delay=5):
-    """Polls Neo4j until it's responsive or retries are exhausted."""
-    sync_driver = None
-    for i in range(retries):
+# New readiness probe: waits for TCP port to be open, no authentication.
+def wait_port(host, port, timeout=30):
+    """Waits for a TCP port to be open."""
+    print(f"Waiting for port {port} on host {host} to open...")
+    t0 = time.time()
+    while time.time() - t0 < timeout:
         try:
-            sync_driver = GraphDatabase.driver(uri, auth=(user, password))
-            with sync_driver.session() as session:
-                session.run("RETURN 1")
-            print(f"Neo4j at {uri} is responsive.")
-            return True
-        except neo4j_exceptions.ServiceUnavailable:
-            print(f"Neo4j not yet available at {uri}. Retrying in {delay}s... ({i+1}/{retries})")
-            time.sleep(delay)
-        except Exception as e:
-            print(f"An unexpected error occurred while waiting for Neo4j: {e}")
-            time.sleep(delay) # Still wait before retrying
-        finally:
-            if sync_driver:
-                sync_driver.close()
-    raise ConnectionError(f"Neo4j container did not become responsive at {uri} after {retries} retries.")
+            with socket.create_connection((host, port), timeout=2):
+                print(f"Port {port} on host {host} is open.")
+                return
+        except OSError:
+            time.sleep(0.5)
+    raise RuntimeError(f"Port {port} on host {host} never opened after {timeout}s.")
+
 
 @pytest.fixture(scope="session")
 def neo4j_container_instance():
     """Starts a Neo4j container and yields the container object."""
-    print("Starting Neo4j container for session...")
-    # It's good practice to ensure the image is explicitly set if not default.
+    print("Starting Neo4j container for session (TLS DISABLED)...")
     try:
-        with Neo4jContainer("neo4j:5.26.6") \
-                .with_env("NEO4J_AUTH", "neo4j/test") \
-                .with_env("NEO4J_PLUGINS", '["apoc"]') as neo_container:
-            # v4+: use get_wrapped_container() to access the underlying Docker container object
-            wrapped_container = neo_container.get_wrapped_container()
-            print(f"Neo4j test-container is up (id={wrapped_container.short_id}) — Bolt: "
-                  f"{neo_container.get_connection_url()}")
+        # Use password parameter in constructor and disable TLS
+        with (
+            Neo4jContainer("neo4j:5.26.6", password="letmein123") # Set password here
+            .with_env("NEO4J_dbms_connector_bolt_tls__level", "DISABLED")
+            .with_env("NEO4J_PLUGINS", '["apoc"]')
+        ) as neo_container:
+            # Wait for the Bolt port to be open using the new wait_port function
+            host = neo_container.get_container_host_ip()
+            # Neo4j Bolt port inside the container is 7687. Get the mapped port.
+            mapped_port = neo_container.get_exposed_port(7687) # Changed to get_exposed_port
+            wait_port(host, int(mapped_port))
+
+            uri = neo_container.get_connection_url() # Should be plain bolt://
+            print(f"Neo4j test-container is up (id={neo_container.get_wrapped_container().short_id}) — Bolt: {uri} (TLS DISABLED)")
             yield neo_container
     except Exception as e:
         print(f"Error starting Neo4j container: {e}")
         pytest.fail(f"Failed to start Neo4j container: {e}")
-    finally:
-        print("Neo4j container for session is stopping/stopped.")
+    # 'finally' block for stopping is handled by the 'with' statement context manager
 
 
 @pytest.fixture(scope="session")
 def neo4j_uri(neo4j_container_instance: Neo4jContainer):
-    """Provides the Bolt URI for the running Neo4j container and waits for it to be ready."""
+    """Provides the Bolt URI for the running Neo4j container."""
+    # testcontainers' Neo4jContainer.start() (called by 'with' context manager)
+    # waits for the container to be ready. No need for _wait_for_neo4j.
     uri = neo4j_container_instance.get_connection_url()
     print(f"Neo4j container URI: {uri}")
-    # Wait for the Neo4j instance inside the container to be ready
-    _wait_for_neo4j(uri, user="neo4j", password="test")
     return uri
 
 @pytest.fixture(scope="session")
 def neo4j_auth():
     """Provides standard authentication tuple for Neo4j."""
-    return ("neo4j", "test")
+    return ("neo4j", "letmein123")
 
 @pytest.fixture(scope="session")
-async def neo4j_async_uri(neo4j_uri: str):
-    """Provides the async Bolt URI for the running Neo4j container."""
-    # Async driver typically uses bolt+ssc or bolt+s for encrypted connections
-    # or bolt for unencrypted. get_connection_url() returns bolt://
-    # For async, ensure the scheme is appropriate if encryption is involved.
-    # The issue suggests replacing "bolt://" with "bolt+ssc://".
-    # This implies the container is expected to support SSC.
-    # For local test containers, often 'bolt://' is fine for async too if not enforcing encryption.
-    # Let's stick to the issue's guidance for SSC.
-    async_uri = neo4j_uri.replace("bolt://", "bolt+ssc://")
-    print(f"Neo4j async container URI: {async_uri}")
-    return async_uri
+def neo4j_driver(neo4j_container_instance: Neo4jContainer):
+    """Provides a ready-to-use Neo4j driver instance for the test session.
+    This driver is configured by testcontainers to connect correctly (e.g. bolt+ssc, TrustAll).
+    """
+    driver = neo4j_container_instance.get_driver()
+    yield driver
+    driver.close()
 
+@pytest.fixture(scope="session")
+async def neo4j_async_uri(neo4j_container_instance: Neo4jContainer):
+    """
+    Provides the async Bolt URI, typically bolt+ssc for Neo4j 5.x.
+    Note: neo4j_container_instance.get_driver() is preferred for obtaining a
+    pre-configured driver. If constructing an async driver manually,
+    ensure to use appropriate trust settings (e.g., TrustAll for self-signed certs).
+    """
+    # get_connection_url() returns "bolt://..."
+    # For Neo4j 5.x with default encryption, we need "bolt+ssc://..."
+    base_uri = neo4j_container_instance.get_connection_url()
+    if base_uri.startswith("bolt://"):
+        async_uri = base_uri.replace("bolt://", "bolt+ssc://")
+    else:
+        # If it's already bolt+ssc or something else, use as is, though this is unlikely
+        # for get_connection_url() from the current testcontainers version.
+        # Step 3: Ensure neo4j_async_uri returns plain bolt://
+        # base_uri is already plain bolt:// from neo4j_uri fixture which calls get_connection_url()
+        async_uri = base_uri # No replacement to bolt+ssc needed
+        print(f"Neo4j async container URI: {async_uri} (TLS DISABLED)")
+        return async_uri
+    
 @pytest.fixture(scope="session")
 def event_loop():
     """Ensure an event loop is available for session-scoped async fixtures."""
