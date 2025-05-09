@@ -45,11 +45,13 @@ class Neo4jMemoryService(BaseMemoryService):
             # Full-text index
             try:
                 await self._execute_write(
-                    "CALL db.index.fulltext.createNodeIndex('MemoryTextIndex', ['MemoryChunk'], ['text'])"
+                    """CREATE FULLTEXT INDEX MemoryTextIndex IF NOT EXISTS
+                    FOR (m:MemoryChunk) ON EACH [m.text]
+                    OPTIONS {indexConfig: { `fulltext.analyzer`: 'standard' }}"""
                 )
                 print("Successfully created/ensured full-text index 'MemoryTextIndex'.")
             except neo4j.exceptions.ClientError as e:
-                if "An equivalent index already exists" not in str(e) and "already exists" not in str(e):
+                if "An equivalent index already exists" not in str(e) and "already exists" not in str(e) and "Constraint already created" not in str(e):
                     print(f"Failed to create full-text index 'MemoryTextIndex': {e}")
                     # raise # Or handle more gracefully
                 else:
@@ -58,37 +60,18 @@ class Neo4jMemoryService(BaseMemoryService):
             # Vector index
             if self._vector_dim:
                 index_name = 'MemoryVectorIndex'
-                created_via_procedure = False
-                # Try procedure first (older Neo4j 5.x)
                 try:
                     await self._execute_write(
-                        f"CALL db.index.vector.createNodeIndex('{index_name}', 'MemoryChunk', 'embedding', $dim, 'cosine')",
-                        {"dim": int(self._vector_dim)}
+                        f"""CREATE VECTOR INDEX {index_name} IF NOT EXISTS
+                        FOR (m:MemoryChunk) ON (m.embedding)
+                        OPTIONS {{ indexConfig: {{ `vector.dimensions`: {int(self._vector_dim)}, `vector.similarity_function`: 'cosine' }} }}"""
                     )
-                    print(f"Successfully created/ensured vector index '{index_name}' using procedure.")
-                    created_via_procedure = True
-                except neo4j.exceptions.ClientError as e_proc:
-                    if "An equivalent index already exists" in str(e_proc) or "already exists" in str(e_proc):
-                        print(f"Vector index '{index_name}' (procedure) already exists.")
-                        created_via_procedure = True # Assume it exists with correct config
-                    elif "Unknown procedure" in str(e_proc) or "No procedure" in str(e_proc):
-                        # Procedure might not exist on newer versions, try DDL
-                        print(f"Vector index procedure for '{index_name}' not found, trying DDL.")
-                        try:
-                            await self._execute_write(
-                                f"""CREATE VECTOR INDEX {index_name} IF NOT EXISTS
-                                FOR (m:MemoryChunk) ON (m.embedding)
-                                OPTIONS {{indexConfig:{{`vector.dimensions`:{int(self._vector_dim)}, `vector.similarity_function`:'cosine'}}}}"""
-                            )
-                            print(f"Successfully created/ensured vector index '{index_name}' using DDL.")
-                        except neo4j.exceptions.ClientError as e_ddl:
-                            if "An equivalent index already exists" not in str(e_ddl) and "already exists" not in str(e_ddl):
-                                print(f"Failed to create vector index '{index_name}' using DDL after procedure failed: {e_ddl}")
-                            else:
-                                print(f"Vector index '{index_name}' (DDL) already exists or was concurrently created.")
+                    print(f"Successfully created/ensured vector index '{index_name}' using DDL.")
+                except neo4j.exceptions.ClientError as e_ddl:
+                    if "An equivalent index already exists" not in str(e_ddl) and "already exists" not in str(e_ddl) and "Constraint already created" not in str(e_ddl):
+                        print(f"Failed to create vector index '{index_name}' using DDL: {e_ddl}")
                     else:
-                        # Some other error with the procedure call
-                        print(f"Failed to create vector index '{index_name}' using procedure: {e_proc}")
+                        print(f"Vector index '{index_name}' (DDL) already exists or was concurrently created.")
                 
                 # After attempting creation, fetch and cache the dimension from DB
                 # This also serves as a check that the index exists with some dimension

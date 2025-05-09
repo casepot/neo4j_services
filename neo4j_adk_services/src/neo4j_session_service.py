@@ -1,11 +1,14 @@
 from neo4j import GraphDatabase, Record # Added Record
-from google.adk.sessions import BaseSessionService, Session
+from google.adk.sessions import BaseSessionService
+from .my_session import Session  # <-- use the wrapped version everywhere
 from google.adk.sessions.base_session_service import ListSessionsResponse, ListEventsResponse
 from google.adk.events import Event, EventActions # Assuming EventActions might contain tool_calls
 from google.genai import types  # for Content, Part
 import json # For _extract_tool_calls and _encode_event
 import uuid # For _extract_tool_calls
 import time # For _encode_event and create_session
+import math # For floor function
+import logging
 
 
 # Custom exception for optimistic locking failures
@@ -141,7 +144,8 @@ class Neo4jSessionService(BaseSessionService):
             id=session_data.get("id", session_id),
             state=merged_state, # Use the merged state for the Session object
             events=[],
-            last_update_time=python_last_update_time_s # Use the DB timestamp
+            last_update_time=python_last_update_time_s, # Use the DB timestamp
+            last_update_time_ms=db_last_update_time_ms # Add the ms timestamp
         )
         return sess
 
@@ -163,6 +167,9 @@ class Neo4jSessionService(BaseSessionService):
         import json
         state = json.loads(s_node.get('state_json', '{}'))
         # Reconstruct Session object
+        db_last_update_time_ms = s_node.get('last_update_time')
+        python_last_update_time_s = db_last_update_time_ms / 1000.0 if db_last_update_time_ms is not None else __import__("time").time()
+
         sess = Session(
             app_name=s_node['app_name'],
             user_id=s_node['user_id'],
@@ -170,7 +177,8 @@ class Neo4jSessionService(BaseSessionService):
             state=state,
             events=[],
             # Convert last_update_time from ms (Neo4j) to seconds (Python Session object)
-            last_update_time=s_node.get('last_update_time') / 1000.0 if s_node.get('last_update_time') is not None else __import__("time").time()
+            last_update_time=python_last_update_time_s,
+            last_update_time_ms=db_last_update_time_ms
         )
         # Reconstruct Event objects for each event node
         for e_node in events_list:
@@ -346,8 +354,8 @@ class Neo4jSessionService(BaseSessionService):
 
         # Client's last known session update time in milliseconds for optimistic locking
         # session.last_update_time is in seconds (float)
-        # float->int round-trip exactly; avoids off-by-1 ms optimistic-lock failures
-        client_last_update_time_ms = int(round(session.last_update_time * 1000))
+        # optimistic-locking check – skip float round-trip entirely
+        client_last_update_time_ms = session.last_update_time_ms
  
         query = """
         // P7: Update AppState if app_state_delta is provided
@@ -372,12 +380,12 @@ class Neo4jSessionService(BaseSessionService):
         
         WITH s // Carry the successfully matched and updated session
         
-        CREATE (e:Event)-[:OF_SESSION]->(s)
+        CREATE (s)-[:HAS_EVENT]->(e:Event)
         SET e = $event_props // event_props contains 'timestamp' in seconds for the Event node
         
         // Link to previous event if exists (NEXT relationship)
         WITH s, e
-        OPTIONAL MATCH (prev_event:Event)-[:OF_SESSION]->(s)
+        OPTIONAL MATCH (s)-[:HAS_EVENT]->(prev_event:Event)
         WHERE prev_event.timestamp < e.timestamp AND prev_event <> e // Compare event timestamps (seconds)
         WITH s, e, prev_event ORDER BY prev_event.timestamp DESC LIMIT 1
         FOREACH (_ IN CASE WHEN prev_event IS NOT NULL THEN [1] ELSE [] END |
@@ -387,9 +395,9 @@ class Neo4jSessionService(BaseSessionService):
         WITH s, e
         UNWIND [k IN keys($current_persisted_state_keys_values) WHERE NOT (k STARTS WITH 'app:' OR k STARTS WITH 'user:')] AS k_session
           WITH s, e, k_session,
-               $previous_values_for_delta[k_session] AS fromVal,
-               $current_persisted_state_keys_values[k_session] AS toVal
-          CREATE (e)-[:WROTE_STATE {key: k_session, fromValue_json: CASE WHEN fromVal IS NOT NULL THEN apoc.convert.toJson(fromVal) ELSE null END, toValue_json: CASE WHEN toVal IS NOT NULL THEN apoc.convert.toJson(toVal) ELSE null END, timestamp: e.timestamp}]->(s)
+               apoc.map.get($previous_values_for_delta, k_session, null) AS fromVal,
+               apoc.map.get($current_persisted_state_keys_values, k_session, null) AS toVal
+          CREATE (e)-[:WROTE_STATE {key: k_session, fromValue_json: apoc.convert.toJson(fromVal), toValue_json: apoc.convert.toJson(toVal), timestamp: e.timestamp}]->(s)
 
         // Create INVOKED_TOOL relationships (will be skipped on an empty list)
         FOREACH (tc_data IN $tool_calls_data |
@@ -415,10 +423,23 @@ class Neo4jSessionService(BaseSessionService):
             "app_state_delta": app_state_delta, # P7
             "user_state_delta": user_state_delta # P7
         }
- 
+        logging.debug(f"Executing Cypher query for append_event. Session ID: {session.id}")
+        logging.debug(f"Query: {query}")
+        logging.debug(f"Params: {json.dumps(params, indent=2)}") # Log params as pretty JSON
+        logging.debug(f"Previous values for delta: {json.dumps(previous_values_for_delta, indent=2)}")
+        logging.debug(f"Current persisted state keys/values: {json.dumps(current_persisted_state_keys_values, indent=2)}")
+
         result = self._execute_write(query, params)
         
         if not result or not result[0].get("new_session_last_update_time_ms"):
+            logging.error(f"StaleSessionError for session {session.id}. Client timestamp (ms): {client_last_update_time_ms}.")
+            logging.error(f"Query result: {result}")
+            # Log details about what might be missing from the result
+            if not result:
+                logging.error("Result from _execute_write was None or empty.")
+            elif not result[0].get("new_session_last_update_time_ms"):
+                logging.error(f"Result[0] did not contain 'new_session_last_update_time_ms'. Result[0]: {result[0]}")
+
             raise StaleSessionError(
                 f"Session {session.id} update failed due to stale data. "
                 f"Client timestamp: {client_last_update_time_ms}, current DB timestamp may differ."
@@ -426,6 +447,7 @@ class Neo4jSessionService(BaseSessionService):
 
         new_db_timestamp_ms = result[0]["new_session_last_update_time_ms"]
         session.last_update_time = new_db_timestamp_ms / 1000.0 # Update Python session with new time in seconds
+        session.last_update_time_ms = new_db_timestamp_ms # Update ms timestamp as well
         
         # event.timestamp was set at the beginning of the method if not present.
         # session.last_update_time is now updated from DB.

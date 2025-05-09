@@ -137,7 +137,7 @@ def test_append_event_state_update(session_service: Neo4jSessionService):
     assert sess.events[0].id == evt.id # Compare by ID
 
     assert evt.id is not None
-    assert sess.last_update_time != pytest.approx(original_last_update_time, rel=1e-5)
+    assert sess.last_update_time != pytest.approx(original_last_update_time, abs=1e-3)
     assert sess.last_update_time > original_last_update_time
 
     fetched = session_service.get_session(app_name="test_app", user_id="user123", session_id=sess.id)
