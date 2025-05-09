@@ -65,7 +65,6 @@ class Neo4jSessionService(BaseSessionService):
             session_id = Session.new_id() if hasattr(Session, "new_id") else uuid.uuid4().hex
         
         initial_session_state = state or {}
-
         # P7: Fetch and merge shadow AppState and UserState
         shadow_app_state_query = """
         OPTIONAL MATCH (as:AppState {app_name: $app_name})
@@ -114,31 +113,37 @@ class Neo4jSessionService(BaseSessionService):
             s.user_id = $user_id,
             s.state_json = $state_json,
             s.last_update_time = timestamp() // Use Neo4j's timestamp for milliseconds
-        RETURN s.app_name AS app_name, s.user_id AS user_id, s.id AS id, s.state_json AS state_json, s.last_update_time AS last_update_time
+        RETURN s.app_name AS app_name, s.user_id AS user_id, s.id AS id, s.state_json AS state_json, s.last_update_time AS last_update_time_ms
         """
         params = {
             "app_name": app_name,
             "user_id": user_id,
             "session_id": session_id,
             "state_json": state_json
-            # "timestamp": current_timestamp # No longer passing Python timestamp
         }
         result = self._execute_write(query, params)
-        
-        session_data = result[0] if result else {}
-        
-        # Convert last_update_time from ms (Neo4j) to seconds (Python Session object)
-        db_last_update_time_ms = session_data.get("last_update_time")
-        python_last_update_time_s = db_last_update_time_ms / 1000.0 if db_last_update_time_ms is not None else time.time()
 
-        return Session(
+        if not result or not result[0].get("last_update_time_ms"):
+             # Handle error: session creation failed or timestamp wasn't returned
+             # For simplicity, raise an error or return None, depending on desired behavior
+             raise RuntimeError(f"Failed to create session {session_id} or retrieve its timestamp.")
+
+        session_data = result[0]
+
+        # Use the timestamp returned directly from the DB
+        db_last_update_time_ms = session_data["last_update_time_ms"]
+        python_last_update_time_s = db_last_update_time_ms / 1000.0
+
+        # Create the session object using the DB-generated timestamp
+        sess = Session(
             app_name=session_data.get("app_name", app_name),
             user_id=session_data.get("user_id", user_id),
             id=session_data.get("id", session_id),
             state=merged_state, # Use the merged state for the Session object
             events=[],
-            last_update_time=python_last_update_time_s
+            last_update_time=python_last_update_time_s # Use the DB timestamp
         )
+        return sess
 
     def get_session(self, *, app_name: str, user_id: str, session_id: str, config: dict = None) -> Session:
         # Fetch session and all its events from Neo4j
@@ -341,19 +346,20 @@ class Neo4jSessionService(BaseSessionService):
 
         # Client's last known session update time in milliseconds for optimistic locking
         # session.last_update_time is in seconds (float)
-        client_last_update_time_ms = int(session.last_update_time * 1000)
+        # float->int round-trip exactly; avoids off-by-1 ms optimistic-lock failures
+        client_last_update_time_ms = int(round(session.last_update_time * 1000))
  
         query = """
         // P7: Update AppState if app_state_delta is provided
         FOREACH (ignoreMe IN CASE WHEN size(keys($app_state_delta)) > 0 THEN [1] ELSE [] END |
             MERGE (as:AppState {app_name: $app_name})
-            ON CREATE SET as.state_json = apoc.convert.toJson($app_state_delta), as.version = timestamp()
+            ON CREATE SET as.state_json = apoc.convert.toJson($app_state_delta), as.version = 0
             ON MATCH SET as.state_json = apoc.convert.toJson(apoc.map.merge(CASE WHEN as.state_json IS NULL THEN {} ELSE apoc.convert.fromJsonMap(as.state_json) END, $app_state_delta)), as.version = timestamp()
         )
         // P7: Update UserState if user_state_delta is provided
         FOREACH (ignoreMe IN CASE WHEN size(keys($user_state_delta)) > 0 THEN [1] ELSE [] END |
             MERGE (us:UserState {app_name: $app_name, user_id: $user_id})
-            ON CREATE SET us.state_json = apoc.convert.toJson($user_state_delta), us.version = timestamp()
+            ON CREATE SET us.state_json = apoc.convert.toJson($user_state_delta), us.version = 0
             ON MATCH SET us.state_json = apoc.convert.toJson(apoc.map.merge(CASE WHEN us.state_json IS NULL THEN {} ELSE apoc.convert.fromJsonMap(us.state_json) END, $user_state_delta)), us.version = timestamp()
         )
         WITH $session_id AS session_id, $app_name AS app_name, $user_id AS user_id // Carry over parameters explicitly
@@ -385,13 +391,13 @@ class Neo4jSessionService(BaseSessionService):
                $current_persisted_state_keys_values[k_session] AS toVal
           CREATE (e)-[:WROTE_STATE {key: k_session, fromValue_json: CASE WHEN fromVal IS NOT NULL THEN apoc.convert.toJson(fromVal) ELSE null END, toValue_json: CASE WHEN toVal IS NOT NULL THEN apoc.convert.toJson(toVal) ELSE null END, timestamp: e.timestamp}]->(s)
 
-        // Create INVOKED_TOOL relationships
-        WITH e, s // Pass s along if needed, though not directly used in UNWIND tool_calls
-        UNWIND $tool_calls_data AS tc_data
+        // Create INVOKED_TOOL relationships (will be skipped on an empty list)
+        FOREACH (tc_data IN $tool_calls_data |
           MERGE (t:ToolCall {id: tc_data.id})
-          SET t += tc_data
+          SET   t += tc_data
           CREATE (e)-[:INVOKED_TOOL]->(t)
-          
+        )
+
         // Return the event id and the new session update time (in ms from DB)
         RETURN e.id AS event_id, s.last_update_time AS new_session_last_update_time_ms
         """

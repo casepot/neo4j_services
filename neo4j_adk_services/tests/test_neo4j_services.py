@@ -68,10 +68,17 @@ def session_service(neo4j_uri, neo4j_auth, clear_db): # Depends on clear_db to r
     service.close()
 
 @pytest_asyncio.fixture(scope="function")
-async def memory_service(neo4j_async_uri, neo4j_auth, clear_db): # Depends on clear_db
+async def memory_service(neo4j_uri, neo4j_async_uri, neo4j_auth, clear_db): # Depends on clear_db
     """Provides a Neo4jMemoryService instance connected to the testcontainer DB."""
+    # Prefer the synchronous value; fall back to the coroutine
+    uri_to_use = neo4j_uri or neo4j_async_uri
+    if asyncio.iscoroutine(uri_to_use):
+        uri_to_use = await uri_to_use            # resolve coroutine → str
+    if not uri_to_use:
+        raise RuntimeError("Unable to determine Neo4j bolt URI for memory_service")
+
     service = Neo4jMemoryService(
-        uri=neo4j_async_uri, # Use async URI
+        uri=uri_to_use,
         user=neo4j_auth[0],
         password=neo4j_auth[1],
         database="neo4j",
